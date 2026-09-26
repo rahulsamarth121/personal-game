@@ -6,6 +6,14 @@ Canonical Kaggle entrypoint (ONE file, stdlib only)::
     python kaggle/runner.py all
     python kaggle/runner.py [clone|diagnostics|setup|run|cleanup|all]
 
+The SAME file also supports direct execution inside Jupyter/Kaggle: paste
+the entire source into one cell and Run. The entry point detects the
+interactive kernel, never parses the kernel's own ``sys.argv`` (which
+holds a ``kernel-*.json`` connection file), and runs the safe default
+command ``diagnostics`` (read-only). Further cells can invoke specific
+commands programmatically: ``runner.main(["all"])``, ``runner.main(["run"])``,
+``runner.main(["cleanup"])`` — always with an explicit argument list.
+
 Workflow: detect environment -> clone/pull the GitHub repo -> check deps ->
 diagnose capabilities honestly -> build shared ``cmd/agent`` -> launch it
 -> register via enroll/heartbeat -> monitor. ``cleanup`` removes ephemeral
@@ -521,11 +529,69 @@ def print_status(cfg: dict) -> None:
         print("      Set STREAMING_ALLOWED=true only with explicit provider permission.")
 
 
+# --- execution context / argument resolution ------------------------------
+
+# Safe default when the whole runner source is pasted into a notebook cell:
+# read-only, honest, non-destructive, and it never starts a game host.
+NOTEBOOK_DEFAULT_COMMAND = "diagnostics"
+
+
+def _in_ipython_interactive() -> bool:
+    """True only inside an IPython/Jupyter interactive kernel.
+
+    Plain ``python`` / ``python runner.py`` has no IPython at all. A
+    terminal IPython session is still a terminal, so CLI semantics apply.
+    Notebook kernels (Kaggle, Colab, Jupyter) run a non-terminal
+    InteractiveShell — exactly the case where kernel argv must be ignored.
+    """
+    try:
+        from IPython import get_ipython
+    except Exception:
+        return False
+    try:
+        ipy = get_ipython()
+    except Exception:
+        return False
+    if ipy is None:
+        return False
+    return type(ipy).__name__ != "TerminalInteractiveShell"
+
+
+def resolve_runner_argv(argv=None):
+    """Resolve ``(args_list, notebook_mode)`` for ``parser.parse_args``.
+
+    Contract (unit-tested):
+
+    * ``resolve_runner_argv([...])`` / ``main([...])`` — explicit argv wins
+      verbatim; notebook detection is irrelevant (tests, programmatic calls).
+    * ``main()`` in a normal CLI process — parses ``sys.argv[1:]``, exactly
+      the historical behavior.
+    * ``main()`` with the whole source pasted into a Jupyter/Kaggle cell —
+      the kernel's ``sys.argv`` (``-f .../kernel-*.json``) is NOT runner
+      input: return the safe default command instead. The kernel argv is
+      neither parsed (no ``parse_known_args``) nor mutated, and argparse
+      validation is untouched.
+    """
+    if argv is not None:
+        return list(argv), False
+    if _in_ipython_interactive():
+        return [NOTEBOOK_DEFAULT_COMMAND], True
+    return list(sys.argv[1:]), False
+
+
 def main(argv=None) -> int:
+    resolved, notebook_mode = resolve_runner_argv(argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(resolved)
     setup_logging(args.verbose)
     cfg = load_config(args)
+    if notebook_mode:
+        print("NOTEBOOK MODE: runner source executed inside an interactive kernel.")
+        print("The kernel's own arguments were ignored (they are not runner input).")
+        print(f"Running the safe default command {NOTEBOOK_DEFAULT_COMMAND!r} (read-only).")
+        print("Other commands in later cells: runner.main([\"all\"]), "
+              "runner.main([\"run\"]), runner.main([\"cleanup\"]), ...")
+        print()
     print_banner(cfg)
     print_status(cfg)
     print()
@@ -539,4 +605,10 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _rc = main()
+    if _in_ipython_interactive():
+        # Raising SystemExit inside a notebook cell would surface as an
+        # exception traceback even on success; report the code instead.
+        print(f"[runner] exit code: {_rc}")
+    else:
+        raise SystemExit(_rc)

@@ -19,6 +19,24 @@ python kaggle/runner.py all --repo-url https://github.com/rahulsamarth121/person
 python kaggle/runner.py clone | diagnostics | setup | run | cleanup
 ```
 
+## Paste-into-cell mode (Jupyter/Kaggle)
+
+The same file can be pasted **whole** into one notebook cell and Run. The
+entry point detects the interactive kernel and never parses the kernel's
+own `sys.argv` (it holds a `kernel-*.json` connection file — not runner
+input). Direct cell execution runs the safe default `diagnostics` command
+(read-only; it never starts a game host or destroys anything). Later cells
+can invoke other commands programmatically with an explicit argument list:
+
+```python
+runner.main(["all"])       # clone -> diagnostics -> setup -> run
+runner.main(["cleanup"])
+```
+
+The kernel's arguments are neither parsed (`parse_known_args` is not used)
+nor mutated; argparse validation is unchanged. Outside notebooks, CLI
+behavior is identical to before.
+
 On a completely fresh Kaggle kernel, run notebook cell 1 first
 (`kaggle/notebook/personal_game.ipynb`): it loads Secrets, clones the
 repository safely, and executes this runner. The repository must exist

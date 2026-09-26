@@ -12,9 +12,11 @@ import argparse
 import importlib.util
 import json
 import os
+import runpy
 import subprocess
 import sys
 import threading
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -84,6 +86,137 @@ def test_main_uses_only_passed_argv(monkeypatch, tmp_path, _runner, capsys):
     out = capsys.readouterr().out
     assert "kernel-xyz.json" not in out
     assert "invalid choice" not in out
+
+
+# --------------------------------------------------------------------------
+# notebook / CLI entry-point contract (resolve_runner_argv + __main__ path)
+# --------------------------------------------------------------------------
+
+KERNEL_ARGV = ["ipykernel_launcher.py", "-f",
+               "/root/.local/share/jupyter/runtime/kernel-test.json"]
+
+
+def test_resolve_runner_argv_contract(monkeypatch, _runner):
+    # Explicit argv always wins verbatim — notebook detection irrelevant.
+    assert _runner.resolve_runner_argv(["run"]) == (["run"], False)
+    # Plain Python (no IPython): real process argv, unchanged semantics.
+    monkeypatch.setattr(sys, "argv", ["runner.py", "diagnostics"])
+    assert _runner.resolve_runner_argv() == (["diagnostics"], False)
+    # Interactive kernel: kernel argv never becomes runner input.
+    fake = types.ModuleType("IPython")
+
+    class _FakeKernelShell:  # NOT TerminalInteractiveShell
+        pass
+
+    fake.get_ipython = lambda: _FakeKernelShell()
+    monkeypatch.setitem(sys.modules, "IPython", fake)
+    monkeypatch.setattr(sys, "argv", KERNEL_ARGV)
+    resolved, notebook = _runner.resolve_runner_argv()
+    assert notebook is True
+    assert resolved == [_runner.NOTEBOOK_DEFAULT_COMMAND]
+    assert "kernel-test.json" not in resolved
+
+
+def test_ipython_poisoned_argv_enters_notebook_mode(monkeypatch, tmp_path, _runner, capsys):
+    """The exact Kaggle failure: main() with a kernel argv. The kernel JSON
+    must never reach argparse as the runner command; the safe default runs.
+    """
+    fake = types.ModuleType("IPython")
+
+    class _FakeKernelShell:
+        pass
+
+    fake.get_ipython = lambda: _FakeKernelShell()
+    monkeypatch.setitem(sys.modules, "IPython", fake)
+    monkeypatch.setattr(sys, "argv", KERNEL_ARGV)
+    monkeypatch.setenv("WORK_ROOT", str(tmp_path))
+
+    calls = []
+    monkeypatch.setattr(_runner, "cmd_diagnostics",
+                        lambda args: calls.append(getattr(args, "command", None)) or 0)
+    rc = _runner.main()  # argv=None — the pasted-cell scenario
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == ["diagnostics"]
+    assert "NOTEBOOK MODE" in out
+    assert "invalid choice" not in out
+    assert "kernel-test.json" not in out
+
+
+def test_dunder_main_runpy_with_fake_ipython_kernel(monkeypatch, tmp_path, _runner):
+    """End-to-end through the REAL entry path: run the actual runner source
+    with run_name='__main__' (exactly what pasting into a cell does) while a
+    fake IPython kernel supplies the poisoned argv. The old implementation
+    raised SystemExit(2) with 'invalid choice: kernel-*.json' here.
+    """
+    fake = types.ModuleType("IPython")
+
+    class _FakeKernelShell:
+        pass
+
+    fake.get_ipython = lambda: _FakeKernelShell()
+    monkeypatch.setitem(sys.modules, "IPython", fake)
+    monkeypatch.setattr(sys, "argv", KERNEL_ARGV)
+    monkeypatch.setenv("WORK_ROOT", str(tmp_path))
+
+    calls = []
+    real_source = RUNNER.read_text(encoding="utf-8")
+    # Patch the stub in the source string (runpy compiles the actual file;
+    # module-level monkeypatch would not survive the fresh namespace). The
+    # stub records the command it received into a temp file.
+    assert "def cmd_diagnostics(" in real_source
+    calls_file = tmp_path / "calls.txt"
+    patched = real_source.replace(
+        "def cmd_diagnostics(args: argparse.Namespace) -> int:",
+        "def cmd_diagnostics(args: argparse.Namespace) -> int:\n"
+        "    open(r" + repr(str(calls_file)) + ", 'a').write(getattr(args, 'command', '') + '\\n')\n"
+        "    return 0", 1)
+    src_file = tmp_path / "runner_under_test.py"
+    src_file.write_text(patched, encoding="utf-8")
+    # runpy must not raise SystemExit in notebook mode (success reported).
+    runpy.run_path(str(src_file), run_name="__main__")
+    assert calls_file.read_text().splitlines() == ["diagnostics"]
+
+
+def test_real_cli_subprocess_regression(tmp_path):
+    """Normal CLI behavior via real subprocesses (Phase 4 + 6)."""
+    # Plain CLI: unknown args must STILL be rejected by argparse (exit 2) —
+    # proves the fix introduced no parse_known_args-style weakening.
+    proc = subprocess.run([sys.executable, str(RUNNER), "-f", "/tmp/kernel-fake.json"],
+                          capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 2
+    assert "invalid choice" in combined
+
+    # THE Kaggle scenario, end-to-end through the real __main__ path in a
+    # real subprocess: an IPython-kernel shim on PYTHONPATH plus the poisoned
+    # kernel argv. The runner must enter notebook mode and run the safe
+    # default — never 'invalid choice: kernel-*.json'.
+    shim = tmp_path / "ipysim"
+    shim.mkdir()
+    (shim / "IPython.py").write_text(
+        "class _FakeKernelShell:\n    pass\n\n\n"
+        "def get_ipython():\n    return _FakeKernelShell()\n", encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(shim) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    proc = subprocess.run([sys.executable, str(RUNNER), "-f",
+                           "/root/.local/share/jupyter/runtime/kernel-subproc.json"],
+                          capture_output=True, text=True, timeout=300,
+                          cwd=str(tmp_path), env=env)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined[-800:]
+    assert "NOTEBOOK MODE" in proc.stdout
+    assert "invalid choice" not in combined
+    assert "kernel-subproc.json" not in combined
+
+    # --help for the parser and every command.
+    proc = subprocess.run([sys.executable, str(RUNNER), "--help"],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0 and "clone" in proc.stdout and "diagnostics" in proc.stdout
+    for command in ("clone", "diagnostics", "setup", "run", "cleanup", "all"):
+        proc = subprocess.run([sys.executable, str(RUNNER), command, "--help"],
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, command
+        assert command in proc.stdout
 
 
 def test_notebook_bootstrap_on_fresh_kernel(tmp_path, monkeypatch, cells):
