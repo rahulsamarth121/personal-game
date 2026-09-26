@@ -25,6 +25,7 @@ Secrets are never printed. Idempotent: reruns skip finished work.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 from pathlib import Path
@@ -65,6 +67,12 @@ DEFAULTS = {
     "MEDIA_NETWORK": "",   # tailscale | cloudflare_private_network | direct
     "MEDIA_ENDPOINT": "",
     "UPDATE_REPO": "auto",  # auto|always|never
+    # Optional pinned Go toolchain bootstrap (WORK_ROOT-local, no host change):
+    # used only when `go` is absent from PATH. Pin + sha256 pin the official
+    # dl.google.com tarball; GOROOT_URL overrides the source, GOROOT_SHA256
+    # overrides the expected checksum.
+    "GOROOT_URL": "",  # default: pinned dl.google.com linux tarball (see ensure_go_toolchain)
+    "GOROOT_SHA256": "",  # default: pinned official checksum (see ensure_go_toolchain)
 }
 
 SECRET_KEYS = {"GITHUB_TOKEN", "NODE_ENROLLMENT_TOKEN", "PG_API_TOKEN"}
@@ -133,7 +141,7 @@ def load_config(args: argparse.Namespace) -> dict:
     for key in ("repo_url", "branch", "work_root", "control_plane_url",
                 "enroll_token", "node_name", "data_dir", "update_repo",
                 "api_token", "streaming_allowed", "media_network",
-                "media_endpoint"):
+                "media_endpoint", "goroot_url", "goroot_sha256"):
         val = getattr(args, key, None)
         if val:
             cfg[{"repo_url": "GITHUB_REPO_URL", "branch": "GITHUB_BRANCH",
@@ -144,7 +152,9 @@ def load_config(args: argparse.Namespace) -> dict:
                  "api_token": "PG_API_TOKEN",
                  "streaming_allowed": "STREAMING_ALLOWED",
                  "media_network": "MEDIA_NETWORK",
-                 "media_endpoint": "MEDIA_ENDPOINT"}[key]] = val
+                 "media_endpoint": "MEDIA_ENDPOINT",
+                 "goroot_url": "GOROOT_URL",
+                 "goroot_sha256": "GOROOT_SHA256"}[key]] = val
     if not cfg["NODE_NAME"]:
         cfg["NODE_NAME"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "kaggle-node")
     return cfg
@@ -334,32 +344,36 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     repo = find_repo(cfg)
     if repo is None:
         log.warning("Repo not found (run `clone` first); skipping agent capability dump.")
-    elif shutil.which("go") is None:
-        log.warning("Go toolchain missing; skipping agent capability dump.")
     else:
         # Build the shared agent, then ask it for its capability document
         # (`agent caps`: no enrollment, no network I/O, exits immediately).
-        binary = agent_binary(repo, cfg)
-        binary.parent.mkdir(parents=True, exist_ok=True)
-        code, out = run(["go", "build", "-o", str(binary), "./cmd/agent"],
-                        cwd=repo, timeout=900)
-        if code != 0:
-            log.warning("Agent build failed: %s", out[-800:])
+        # Go missing from PATH is not fatal: the pinned WORK_ROOT bootstrap
+        # (see ensure_go_toolchain) supplies a toolchain when possible.
+        go_env = ensure_go_toolchain(cfg)
+        if go_env is None:
+            log.warning("Go toolchain missing and bootstrap unavailable; skipping agent capability dump.")
         else:
-            # Generous timeout: first execution of a fresh binary can stall
-            # under antivirus real-time scanning (observed >60 s on Windows).
-            code, out = run([str(binary), "caps"], timeout=300)
+            binary = agent_binary(repo, cfg)
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            code, out = run(["go", "build", "-o", str(binary), "./cmd/agent"],
+                            cwd=repo, timeout=900, env=go_env)
             if code != 0:
-                log.warning("Agent capability dump failed (exit %d): %s", code, out[-300:])
+                log.warning("Agent build failed: %s", out[-800:])
             else:
-                try:
-                    caps = json.loads(out[out.index("{"):out.rindex("}") + 1])["caps"]
-                    log.info("Agent caps: os=%s arch=%s gpu=%s encoders=%s docker=%s tailscale=%s",
-                             caps.get("os"), caps.get("arch"), (caps.get("gpu") or {}).get("model") or "none",
-                             ",".join(caps.get("encoders") or []) or "none",
-                             caps.get("docker"), caps.get("tailscale"))
-                except Exception:
-                    log.warning("Could not parse agent caps output.")
+                # Generous timeout: first execution of a fresh binary can stall
+                # under antivirus real-time scanning (observed >60 s on Windows).
+                code, out = run([str(binary), "caps"], timeout=300, env=go_env)
+                if code != 0:
+                    log.warning("Agent capability dump failed (exit %d): %s", code, out[-300:])
+                else:
+                    try:
+                        caps = json.loads(out[out.index("{"):out.rindex("}") + 1])["caps"]
+                        log.info("Agent caps: os=%s arch=%s gpu=%s encoders=%s docker=%s tailscale=%s",
+                                 caps.get("os"), caps.get("arch"), (caps.get("gpu") or {}).get("model") or "none",
+                                 ",".join(caps.get("encoders") or []) or "none",
+                                 caps.get("docker"), caps.get("tailscale"))
+                    except Exception:
+                        log.warning("Could not parse agent caps output.")
     control_reachable(cfg["CONTROL_PLANE_URL"])
     streaming = str(cfg.get("STREAMING_ALLOWED", "false")).lower() in ("1", "true", "yes", "on")
     log.info("Streaming allowed: %s", streaming)
@@ -371,6 +385,147 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     if not streaming:
         log.info("This node advertises streaming_allowed=false and will never be scheduled for game sessions.")
     return 0
+
+
+# --- optional Go toolchain bootstrap --------------------------------------
+
+# The Go version the shared agent needs (matches go.mod's `go 1.24` line):
+# the smallest release with that minimum, pinned so the toolchain source and
+# its official sha256 are stable. Kaggle images ship no Go at all, and a
+# moving "latest" pin would silently change what gets downloaded each run.
+PINNED_GO_VERSION = "1.24.11"
+# Official sha256 of the pinned linux-amd64 tarball (go.dev/dl; verified
+# against the Heroku buildpack manifest and the live download itself).
+PINNED_GO_SHA256_LINUX_AMD64 = (
+    "bceca00afaac856bc48b4cc33db7cd9eb383c81811379faed3bdbc80edb0af65"
+)
+
+
+def go_in_paths(env: dict | None = None) -> bool:
+    """True when a `go` executable is already reachable (PATH lookup only)."""
+    if env is None:
+        return shutil.which("go") is not None
+    return shutil.which("go", path=env.get("PATH")) is not None
+
+
+def _work_root_go(cfg: dict) -> Path:
+    """Root of a previously bootstrapped WORK_ROOT-local toolchain, if any."""
+    root = Path(cfg["WORK_ROOT"]) / "go"
+    return root if (root / "bin" / "go").exists() else None
+
+
+def _prefixed_go_env(cfg: dict, base_env: dict | None = None) -> dict:
+    """Env with the WORK_ROOT toolchain first on PATH (never writes env globally)."""
+    env = dict(base_env if base_env is not None else os.environ)
+    root = Path(cfg["WORK_ROOT"]) / "go"
+    env["PATH"] = str(root / "bin") + os.pathsep + env.get("PATH", "")
+    env["GOROOT"] = str(root)
+    env.setdefault("GOTOOLCHAIN", "local")  # never auto-download another Go
+    return env
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _looks_like_go_root(root: Path) -> bool:
+    """Cheap structural sanity check for an extracted toolchain directory."""
+    return (root / "bin" / "go").exists() and (root / "VERSION").exists()
+
+
+def _download_and_extract_go(cfg: dict, url: str, expected_sha: str) -> Path:
+    """Download + sha256-verify + extract the official Go tarball into WORK_ROOT.
+
+    Verify-first: the sha256 is checked before anything is extracted; a
+    failed download or wrong checksum deletes the temp file and raises.
+    """
+    work = Path(cfg["WORK_ROOT"])
+    work.mkdir(parents=True, exist_ok=True)
+    tarball = work / "go-toolchain.tar.gz"
+    log.info("Downloading Go toolchain: %s", url)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=600) as resp, tarball.open("wb") as out:
+            shutil.copyfileobj(resp, out)
+    except Exception as exc:
+        tarball.unlink(missing_ok=True)
+        raise RuntimeError(f"Go toolchain download failed: {exc}") from exc
+    actual = _sha256_of(tarball)
+    if actual != expected_sha:
+        tarball.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Go toolchain sha256 mismatch: got {actual}, want {expected_sha} "
+            "(refusing to extract untrusted toolchain)")
+    staging = work / "go-extract-staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        with tarfile.open(tarball, "r:gz") as tf:
+            tf.extractall(staging)  # noqa: S202 - verified pinned archive
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(f"Go toolchain extraction failed: {exc}") from exc
+    finally:
+        tarball.unlink(missing_ok=True)
+    extracted = staging / "go"
+    if not _looks_like_go_root(extracted):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Extracted Go toolchain is incomplete (bin/go or VERSION missing)")
+    root = work / "go"
+    shutil.rmtree(root, ignore_errors=True)  # atomic-ish replace of any stale toolchain
+    extracted.rename(root)
+    shutil.rmtree(staging, ignore_errors=True)
+    log.info("Go toolchain ready: %s", root)
+    return root
+
+
+def ensure_go_toolchain(cfg: dict, env: dict | None = None) -> dict | None:
+    """Return an env whose PATH builds Go code, bootstrapping Go if needed.
+
+    Order (idempotent, honors an operator-provided toolchain):
+
+    1. `go` already reachable in the incoming env (or the process env when
+       none is given) -> return that env unchanged.
+    2. A previously bootstrapped WORK_ROOT/go toolchain exists -> prepend it
+       to PATH (env copy; os.environ is never mutated).
+    3. Otherwise download the pinned official linux-amd64 tarball into
+       WORK_ROOT, verify its sha256, extract, then prepend as in (2).
+
+    Always returns a *concrete* env dict on success (never the None default
+    -- a present system Go and a failed bootstrap must not be confusable);
+    None only when bootstrap is disabled (GOROOT_SHA256=never) or when the
+    download/verification fails (the caller reports honestly). Never touches
+    anything outside WORK_ROOT; never asks for host package installs.
+    """
+    base = dict(env) if env is not None else dict(os.environ)
+    if go_in_paths(base):
+        return base
+    if str(cfg.get("GOROOT_SHA256", "")).lower() == "never":
+        return None
+    if (existing := _work_root_go(cfg)) is not None:
+        log.info("Using previously bootstrapped Go toolchain: %s", existing)
+        return _prefixed_go_env(cfg, base)
+    if platform.system().lower() != "linux" and not cfg.get("GOROOT_URL"):
+        # The pin is the official linux-amd64 tarball: correct for Kaggle,
+        # useless elsewhere. Fail honestly instead of extracting an ELF
+        # toolchain that this OS cannot execute.
+        log.warning("Go bootstrap is pinned for Linux (Kaggle); on this OS "
+                    "install Go >= 1.24 or set GOROOT_URL + GOROOT_SHA256 "
+                    "to a matching tarball.")
+        return None
+    url = (cfg.get("GOROOT_URL") or
+           f"https://dl.google.com/go/go{PINNED_GO_VERSION}.linux-amd64.tar.gz")
+    expected_sha = (cfg.get("GOROOT_SHA256") or PINNED_GO_SHA256_LINUX_AMD64)
+    try:
+        _download_and_extract_go(cfg, url, expected_sha)
+    except Exception as exc:
+        log.warning("Go bootstrap failed: %s", exc)
+        return None
+    return _prefixed_go_env(cfg, base)
 
 
 def agent_binary(repo: Path, cfg: dict) -> Path:
@@ -385,8 +540,9 @@ def agent_binary(repo: Path, cfg: dict) -> Path:
 def cmd_setup(args: argparse.Namespace) -> int:
     """Idempotent: ensure toolchain, data dirs, and a fresh agent binary."""
     cfg = load_config(args)
-    if shutil.which("go") is None:
-        log.error("Go toolchain missing. Install Go >= 1.24 in this environment first.")
+    go_env = ensure_go_toolchain(cfg)
+    if go_env is None:
+        log.error("Go toolchain missing and bootstrap unavailable/disabled. Install Go >= 1.24 in this environment first.")
         return 1
     repo = find_repo(cfg)
     if repo is None:
@@ -406,7 +562,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         log.info("Agent binary up to date: %s", binary)
         return 0
     log.info("Building node agent...")
-    code, out = run(["go", "build", "-o", str(binary), "./cmd/agent"], cwd=repo, timeout=900)
+    code, out = run(["go", "build", "-o", str(binary), "./cmd/agent"],
+                    cwd=repo, timeout=900, env=go_env)
     if code != 0:
         log.error("Build failed: %s", out[-4000:])
         return 1
@@ -423,6 +580,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
     if not cfg["NODE_ENROLLMENT_TOKEN"]:
         log.warning("NODE_ENROLLMENT_TOKEN unset; enrollment may be rejected.")
+    # Resolve the build environment once up front: cmd_setup would otherwise
+    # bootstrap its own Go, and the foreground agent should launch in the
+    # same environment the binary was built in (idempotent on rerun).
+    go_env = ensure_go_toolchain(cfg)
+    if go_env is None:
+        log.error("Go toolchain missing and bootstrap unavailable/disabled. Install Go >= 1.24 in this environment first.")
+        return 1
     if cmd_setup(args) != 0:
         return 1
     repo = find_repo(cfg)
@@ -440,6 +604,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         env["MEDIA_NETWORK"] = cfg["MEDIA_NETWORK"]
     if cfg.get("MEDIA_ENDPOINT"):
         env["MEDIA_ENDPOINT"] = cfg["MEDIA_ENDPOINT"]
+    # The agent runs in the same environment it was built in: the bootstrapped
+    # toolchain's PATH/GOROOT lead, with the operator env layered over it.
+    for key, value in go_env.items():
+        env.setdefault(key, value)
     log_path = Path(cfg["WORK_ROOT"]) / "agent.log"
     log.info("Node: %s -> %s", cfg["NODE_NAME"], cfg["CONTROL_PLANE_URL"])
     log.info("Streaming allowed: %s", env["STREAMING_ALLOWED"])
@@ -499,6 +667,8 @@ def cmd_all(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--repo-url", help="override GITHUB_REPO_URL")
+    common.add_argument("--goroot-url", help="override GOROOT_URL (Go tarball source for the WORK_ROOT bootstrap)")
+    common.add_argument("--goroot-sha256", help="override GOROOT_SHA256 ('never' disables Go bootstrap)")
     common.add_argument("--branch", help="override GITHUB_BRANCH")
     common.add_argument("--work-root", help="override WORK_ROOT")
     common.add_argument("--control-plane-url", help="override CONTROL_PLANE_URL")

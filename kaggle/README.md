@@ -66,6 +66,8 @@ Media:           provider-neutral
 | `STREAMING_ALLOWED` | `false` (default) — `true` **only** with explicit provider permission |
 | `MEDIA_NETWORK` | `tailscale` \| `cloudflare_private_network` \| `direct` (unset = measured Tailscale) |
 | `MEDIA_ENDPOINT` | Moonlight-reachable IP/DNS when the provider needs one |
+| `GOROOT_URL` | Go tarball source for the WORK_ROOT bootstrap (default: pinned official `dl.google.com/go/go1.24.11.linux-amd64.tar.gz`) |
+| `GOROOT_SHA256` | expected sha256 of that tarball (default: pinned official checksum; `never` disables the bootstrap) |
 
 CLI overrides exist for every key (`--help`), but prefer Secrets over flags
 on Kaggle so tokens never appear in notebook output or logs.
@@ -77,11 +79,31 @@ on Kaggle so tokens never appear in notebook output or logs.
    helper and is never embedded in URLs or printed).
 2. `diagnostics` — honest capability report: GPU, encoders, disk, tools,
    control-plane reachability, streaming policy, media network.
-3. `setup` — installs/uses the Go toolchain and builds `cmd/agent`.
+3. `setup` — installs/uses the Go toolchain and builds `cmd/agent`
+   (bootstrapping it into `WORK_ROOT` when absent — see below).
 4. `run` — starts the agent: it enrolls (fence token issued), heartbeats to
    renew its lease, polls for assigned sessions, and reports capabilities.
 5. Verify from the control-plane side (Windows UI → Diagnostics, or
    `GET <plane>/v1/nodes/<NODE_NAME>/sessions`).
+
+## Go toolchain bootstrap (no host changes)
+
+Kaggle images ship **no Go toolchain**. The runner does not require one:
+when `go` is absent from `PATH`, `setup` (and the agent-capability dump in
+`diagnostics`) bootstraps a pinned official toolchain **into
+`$WORK_ROOT/go`** — downloaded from `dl.google.com`, verified against a
+pinned sha256 *before* extraction, then prepended to the build PATH for
+that process only (`GOROOT` set, `GOTOOLCHAIN=local` so Go never
+auto-downloads another toolchain). Nothing outside `WORK_ROOT` is touched.
+
+- Order: `go` already on `PATH` wins → reused `$WORK_ROOT/go` wins →
+  pinned download. Reruns are idempotent (cached toolchain, cached builds).
+- Already-installed Go (self-hosted runners) is preferred and untouched.
+- Override either pin via `GOROOT_URL` / `GOROOT_SHA256`; set
+  `GOROOT_SHA256=never` to forbid downloads (air-gapped mode, honest
+  failure).
+- A failing download, checksum mismatch, or corrupted archive is deleted
+  and reported — never extracted, never silently ignored.
 
 ## Where real gaming happens
 

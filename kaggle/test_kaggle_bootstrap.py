@@ -9,6 +9,7 @@ the deployed Worker are run separately (see kaggle/README.md).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -459,6 +460,10 @@ def test_pipeline_clone_discover_build_caps(tmp_path):
         cache_dir = os.environ["PG_TEST_GOCACHE"]
         os.makedirs(cache_dir, exist_ok=True)
         env["GOCACHE"] = cache_dir
+    if os.environ.get("PG_TEST_GOTMPDIR"):
+        gotmp = os.environ["PG_TEST_GOTMPDIR"]
+        os.makedirs(gotmp, exist_ok=True)
+        env["GOTMPDIR"] = gotmp
     clone = subprocess.run([sys.executable, str(RUNNER), "clone"], env=env,
                            capture_output=True, text=True, timeout=300)
     assert clone.returncode == 0, clone.stderr[-500:]
@@ -494,3 +499,330 @@ def test_notebook_default_repo_is_project_public_url(monkeypatch, _runner):
 def tmp_dir_factory():
     import tempfile
     return tempfile.mkdtemp(prefix="pg_nb_default_")
+
+# --------------------------------------------------------------------------
+# missing-Go path: pinned WORK_ROOT toolchain bootstrap (Kaggle ships no Go)
+# --------------------------------------------------------------------------
+
+# A minimal *fake* toolchain: bin/go that prints the env it was run with.
+# Used to prove PATH-prepending and toolchain reuse without any network.
+FAKE_GO_SCRIPT = """#!/bin/sh
+echo fake-go-1.24.11 $PG_BOOTSTRAP_PROOF
+echo PATH=$PATH
+echo GOROOT=$GOROOT
+"""
+
+
+def _fake_toolchain(root, version='fake-go-1.24.11'):
+    """Write a structurally valid fake Go root (bin/go[.exe] + VERSION)."""
+    bin_dir = root / 'bin'
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ('go', 'go.exe'):  # go.exe: Windows shutil.which finds it too
+        go = bin_dir / name
+        go.write_text(FAKE_GO_SCRIPT.replace('fake-go-1.24.11', version))
+        go.chmod(0o755)
+    (root / 'VERSION').write_text(version + chr(10))
+    return root
+
+
+def _tarball_bytes(root):
+    """Deterministic gzipped tar of a toolchain dir, mirroring the official
+    dl.google.com layout: members live under a top-level 'go/' directory."""
+    import io
+    import tarfile as _tarfile
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode='w:gz', format=_tarfile.GNU_FORMAT) as tf:
+        for path in sorted(root.rglob('*')):
+            if path.is_file():
+                tf.add(str(path), arcname='go/' + path.relative_to(root).as_posix())
+    return buf.getvalue()
+
+
+def _no_go_env(monkeypatch):
+    """Simulate 'go is missing from PATH' (subprocess env only)."""
+    monkeypatch.setenv('PATH', os.defpath)
+
+
+def _hidden_go_cfg(tmp_path, **extra):
+    """Config for ensure_go_toolchain with Go hidden from PATH."""
+    cfg = dict(_load_runner().DEFAULTS,
+               WORK_ROOT=str(tmp_path / 'work'),
+               GOROOT_URL='', GOROOT_SHA256='')
+    cfg.update(extra)
+    return cfg
+
+
+def _fake_repo(repo):
+    """A repo find_repo() accepts (go.mod + cmd/agent), agent source optional."""
+    (repo / 'cmd' / 'agent').mkdir(parents=True, exist_ok=True)
+    (repo / 'go.mod').write_text(
+        'module github.com/personal-game/personal-game' + chr(10) * 2 + 'go 1.24' + chr(10))
+    (repo / 'cmd' / 'agent' / 'main.go').write_text(
+        'package main' + chr(10) * 2 + 'func main() {}' + chr(10))
+    return repo
+
+
+def test_setup_fails_honestly_without_go_and_without_bootstrap(tmp_path, monkeypatch, _runner, caplog):
+    """GOROOT_SHA256=never (bootstrap disabled) + no Go anywhere: setup must
+    fail with exit 1 and the honest error -- never fake success."""
+    _no_go_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    rc = _runner.main(['setup', '--work-root', str(tmp_path / 'work'),
+                       '--goroot-sha256', 'never'])
+    assert rc == 1
+    # The runner logs (not prints) the honest failure -- check the log capture.
+    assert 'Go toolchain missing' in caplog.text
+    assert 'bootstrap unavailable/disabled' in caplog.text
+
+
+def test_diagnostics_swallows_bootstrap_failure_and_stays_read_only(tmp_path, monkeypatch, _runner, caplog):
+    """diagnostics with a repo but an unreachable bootstrap source: exit 0,
+    honest warning, and NO toolchain/binary ever left in the work root."""
+    _no_go_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    work = tmp_path / 'work'
+    _fake_repo(work / 'repo')
+    rc = _runner.main(['diagnostics', '--work-root', str(work),
+                       '--control-plane-url', 'http://127.0.0.1:9',
+                       '--goroot-url', 'http://127.0.0.1:9/go.tgz'])
+    assert rc == 0
+    assert 'Go bootstrap failed' in caplog.text
+    assert not (work / 'go').exists()
+    assert not (work / 'bin').exists()
+
+
+def test_ensure_go_uses_system_go_when_present(tmp_path, monkeypatch, _runner):
+    """Go already reachable in the given env: returned unchanged, no
+    WORK_ROOT toolchain consulted or created."""
+    fake_bin = tmp_path / 'sys-go-bin'
+    _fake_toolchain(fake_bin)
+    env = {'PATH': str(fake_bin / 'bin')}  # PATH entries hold the executables
+    cfg = _hidden_go_cfg(tmp_path)
+    got = _runner.ensure_go_toolchain(cfg, env)
+    assert got == env
+    assert not (Path(cfg['WORK_ROOT']) / 'go').exists()
+
+
+def test_ensure_go_reuses_work_root_toolchain_without_download(tmp_path, monkeypatch, _runner):
+    """Second run: the cached WORK_ROOT/go toolchain is prepended to PATH --
+    no download (the unreachable URL proves no second fetch happens)."""
+    _no_go_env(monkeypatch)
+    cfg = _hidden_go_cfg(tmp_path, GOROOT_URL='http://127.0.0.1:9/go.tgz')
+    root = _fake_toolchain(Path(cfg['WORK_ROOT']) / 'go')
+    got = _runner.ensure_go_toolchain(
+        cfg, {'PATH': os.defpath, 'PG_BOOTSTRAP_PROOF': 'reuse'})
+    assert got is not None
+    assert got['PATH'].startswith(str(root / 'bin'))
+    assert got['GOROOT'] == str(root)
+    assert got['GOTOOLCHAIN'] == 'local'
+    if os.name != 'nt':  # exec proof is POSIX-only (shebang scripts)
+        proc = subprocess.run([str(root / 'bin' / 'go')], capture_output=True,
+                              text=True, env=got, timeout=30)
+        assert 'fake-go-1.24.11 reuse' in proc.stdout
+        assert ('PATH=' + str(root / 'bin')) in proc.stdout
+        assert ('GOROOT=' + str(root)) in proc.stdout
+
+
+def test_ensure_go_prepend_never_mutates_process_env(tmp_path, monkeypatch, _runner):
+    """The returned env is a copy: os.environ must stay untouched."""
+    _no_go_env(monkeypatch)
+    cfg = _hidden_go_cfg(tmp_path)
+    _fake_toolchain(Path(cfg['WORK_ROOT']) / 'go')
+    before = dict(os.environ)
+    got = _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath})
+    assert got['PATH'] != os.environ.get('PATH')
+    assert os.environ == before
+    assert 'GOROOT' not in os.environ
+
+
+def _serve_bytes():
+    """Start a local HTTP server serving a dict of path -> bytes."""
+    payloads = {}
+    hits = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits[self.path] = hits.get(self.path, 0) + 1
+            body = payloads.get(self.path)
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, payloads, hits
+
+
+def test_ensure_go_download_success_verifies_and_installs(tmp_path, monkeypatch, _runner):
+    """Full bootstrap: verified tarball downloaded from a *local* HTTP server,
+    extracted into WORK_ROOT/go, PATH-prepended, structural check passed,
+    and no tarball/staging residue left behind."""
+    src = _fake_toolchain(tmp_path / 'src' / 'go')
+    data = _tarball_bytes(src)
+    sha = hashlib.sha256(data).hexdigest()
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go/go1.24.11.linux-amd64.tar.gz'] = data
+        _no_go_env(monkeypatch)
+        cfg = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go/go1.24.11.linux-amd64.tar.gz' % server.server_port,
+            GOROOT_SHA256=sha)
+        got = _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath})
+        assert got is not None
+        root = Path(cfg['WORK_ROOT']) / 'go'
+        assert (root / 'bin' / 'go').exists()
+        assert (root / 'VERSION').read_text().startswith('fake-go-1.24.11')
+        assert got['PATH'].startswith(str(root / 'bin'))
+        work = Path(cfg['WORK_ROOT'])
+        assert not (work / 'go-toolchain.tar.gz').exists()
+        assert not (work / 'go-extract-staging').exists()
+        assert list(hits) == ['/go/go1.24.11.linux-amd64.tar.gz']
+    finally:
+        server.shutdown()
+
+
+def test_ensure_go_download_checksum_mismatch_refuses(tmp_path, monkeypatch, _runner):
+    """Wrong sha256: nothing is extracted, the temp file is deleted, and the
+    caller sees None (honest failure)."""
+    src = _fake_toolchain(tmp_path / 'src' / 'go')
+    data = _tarball_bytes(src)
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go.tgz'] = data
+        _no_go_env(monkeypatch)
+        cfg = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go.tgz' % server.server_port,
+            GOROOT_SHA256='0' * 64)
+        assert _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath}) is None
+        assert hits.get('/go.tgz') == 1
+        work = Path(cfg['WORK_ROOT'])
+        assert not (work / 'go').exists()
+        assert not (work / 'go-extract-staging').exists()
+        assert not (work / 'go-toolchain.tar.gz').exists()
+    finally:
+        server.shutdown()
+
+
+def test_ensure_go_corrupted_toolchain_archive_is_rejected(tmp_path, monkeypatch, _runner):
+    """A structurally broken toolchain (bin/go missing) inside a checksummed
+    archive is refused: no WORK_ROOT/go is ever installed."""
+    src = tmp_path / 'src' / 'go'
+    src.mkdir(parents=True)
+    (src / 'VERSION').write_text('fake-go-1.24.11' + chr(10))
+    data = _tarball_bytes(src)
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go.tgz'] = data
+        _no_go_env(monkeypatch)
+        cfg = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go.tgz' % server.server_port,
+            GOROOT_SHA256=hashlib.sha256(data).hexdigest())
+        assert _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath}) is None
+        assert hits.get('/go.tgz') == 1
+        work = Path(cfg['WORK_ROOT'])
+        assert not (work / 'go').exists()
+        assert not (work / 'go-extract-staging').exists()
+    finally:
+        server.shutdown()
+
+
+def test_ensure_go_idempotent_rerun_replaces_not_duplicates(tmp_path, monkeypatch, _runner):
+    """Reruns are idempotent: a valid WORK_ROOT/go is REUSED (no second
+    download), and a forced re-extract REPLACES it -- never two toolchains,
+    never staging/tarball residue."""
+    old = _tarball_bytes(_fake_toolchain(tmp_path / 'src1' / 'go', version='fake-go-old'))
+    new = _tarball_bytes(_fake_toolchain(tmp_path / 'src2' / 'go', version='fake-go-new'))
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go-old.tgz'] = old
+        payloads['/go-new.tgz'] = new
+        _no_go_env(monkeypatch)
+        cfg = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go-old.tgz' % server.server_port,
+            GOROOT_SHA256=hashlib.sha256(old).hexdigest())
+        work = Path(cfg['WORK_ROOT'])
+        root = work / 'go'
+        # 1. First run downloads + installs.
+        assert _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath}) is not None
+        assert (root / 'VERSION').read_text().startswith('fake-go-old')
+        # 2. Rerun with an UNREACHABLE url: reuse wins, no download attempted.
+        cached = _hidden_go_cfg(tmp_path, GOROOT_URL='http://127.0.0.1:9/go.tgz')
+        assert _runner.ensure_go_toolchain(cached, {'PATH': os.defpath}) is not None
+        assert (root / 'VERSION').read_text().startswith('fake-go-old')
+        assert hits.get('/go-old.tgz') == 1
+        # 3. A new verified extraction REPLACES the toolchain in place.
+        cfg2 = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go-new.tgz' % server.server_port,
+            GOROOT_SHA256=hashlib.sha256(new).hexdigest())
+        _runner._download_and_extract_go(cfg2, cfg2['GOROOT_URL'],
+                                         hashlib.sha256(new).hexdigest())
+        assert (root / 'VERSION').read_text().startswith('fake-go-new')
+        assert sorted(pp.name for pp in work.glob('go*')) == ['go']
+        assert not (work / 'go-toolchain.tar.gz').exists()
+        assert not (work / 'go-extract-staging').exists()
+    finally:
+        server.shutdown()
+
+
+def test_pinned_toolchain_constants_are_official_and_match(_runner):
+    """The pin is the smallest release satisfying go.mod (go 1.24) and the
+    default URL must embed that version -- regresses silent pin drift."""
+    assert _runner.PINNED_GO_VERSION.startswith('1.24.')
+    # Official sha256 for the pinned linux-amd64 tarball (go.dev/dl).
+    assert _runner.PINNED_GO_SHA256_LINUX_AMD64 == (
+        'bceca00afaac856bc48b4cc33db7cd9eb383c81811379faed3bdbc80edb0af65')
+    assert len(_runner.PINNED_GO_SHA256_LINUX_AMD64) == 64
+    int(_runner.PINNED_GO_SHA256_LINUX_AMD64, 16)
+    go_mod = (HERE.parent / 'go.mod').read_text(encoding='utf-8')
+    assert 'go 1.24' in go_mod
+    assert _runner.PINNED_GO_VERSION in (
+        'https://dl.google.com/go/go%s.linux-amd64.tar.gz' % _runner.PINNED_GO_VERSION)
+
+
+@pytest.mark.skipif(os.name == 'nt',
+                    reason='POSIX stub toolchain (Kaggle is Linux); the Windows build path is covered by the real pipeline test')
+def test_setup_builds_agent_after_bootstrap(tmp_path, monkeypatch, _runner):
+    """setup with Go hidden from PATH but a cached WORK_ROOT toolchain:
+    the build runs through the prepended env (proven via a stub go that
+    writes the -o target) -- the clone-to-build chain uses the bootstrapped
+    toolchain env, not the system one."""
+    _no_go_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    cfg = _hidden_go_cfg(tmp_path)
+    work = Path(cfg['WORK_ROOT'])
+    root = _fake_toolchain(work / 'go')
+    stub = root / 'bin' / 'go'
+    stub.write_text("""#!/bin/sh
+if [ "$1" = "build" ]; then
+  out=""
+  prev=""
+  for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done
+  [ -n "$out" ] && : > "$out"
+  exit 0
+fi
+echo fake-go-1.24.11
+""")
+    stub.chmod(0o755)
+    _fake_repo(work / 'repo')
+    # Binary deliberately absent so setup must take the build path.
+    rc = _runner.cmd_setup(argparse.Namespace(
+        repo_url=str(work / 'repo'), branch='main', work_root=str(work),
+        control_plane_url='', enroll_token='', node_name='', data_dir='',
+        update_repo='auto', api_token='', streaming_allowed='false',
+        media_network='', media_endpoint='', goroot_url='', goroot_sha256='',
+        verbose=False, func=None))
+    assert rc == 0, 'setup must succeed using the bootstrapped toolchain env'
+    assert (work / 'bin' / 'agent').exists()

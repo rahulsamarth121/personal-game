@@ -21,3 +21,10 @@ reports what exists (`unavailable` otherwise, never faked). Outbound
 control only. Cleanup removes ephemeral staging, never saves.
 Notebook `kaggle/notebook/personal_game.ipynb` is a 6-cell thin wrapper
 (markdown intro + bootstrap cell + diagnostics/setup/run/cleanup).
+
+Go is NOT preinstalled on Kaggle images: when `go` is missing from PATH,
+`setup`/`diagnostics` bootstrap a pinned, sha256-verified official Go
+tarball into `$WORK_ROOT/go` and prepend it to the build PATH (env copy
+only — no host modification; `GOROOT_SHA256=never` disables the
+bootstrap). Preinstalled Go is preferred when present; reruns reuse the
+cached toolchain. See `kaggle/README.md` for the exact behavior.
