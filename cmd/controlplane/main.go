@@ -46,6 +46,9 @@ func main() {
 	sessMgr, savesMgr := wireStores(cfg, reg, cat)
 
 	srv := api.NewFull(cat, reg, sessMgr, savesMgr)
+	if cfg.EnrollToken != "" {
+		srv.EnrollToken = cfg.EnrollToken
+	}
 	fmt.Fprintln(os.Stderr, "controlplane: listening on", cfg.ListenAddr)
 	handler := auth.ClientAuthMiddleware(cfg.APIToken, srv)
 	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {

@@ -44,6 +44,11 @@ DEFAULT_CONTROL_PLANE_URL = (
     "https://personal-game-relay.rahul-zed-relay-84739261.workers.dev/personal-game"
 )
 
+# This project's own public repository: the paste-one-cell default so a
+# fresh kernel can clone + report real agent capabilities with zero setup.
+# Operators override with their fork via GITHUB_REPO_URL / --repo-url.
+DEFAULT_REPO_URL = "https://github.com/rahulsamarth121/personal-game.git"
+
 DEFAULTS = {
     "GITHUB_REPO_URL": "",
     "GITHUB_BRANCH": "main",
@@ -101,7 +106,7 @@ def print_banner(cfg: dict | None = None) -> None:
     print("PERSONAL GAME NODE")
     print("==================")
     print()
-    print(f"Repository:      <clone target of --repo-url>")
+    print("Repository:      " + ((cfg or {}).get("GITHUB_REPO_URL") or "(set GITHUB_REPO_URL / --repo-url)"))
     print(f"Node runner:     {repo}")
     print("Shared agent:    Go node agent (cmd/agent) — no second implementation")
     print("Control Plane:   " + (cfg or {}).get("CONTROL_PLANE_URL", DEFAULT_CONTROL_PLANE_URL))
@@ -329,19 +334,32 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     repo = find_repo(cfg)
     if repo is None:
         log.warning("Repo not found (run `clone` first); skipping agent capability dump.")
+    elif shutil.which("go") is None:
+        log.warning("Go toolchain missing; skipping agent capability dump.")
     else:
-        code, out = run(["go", "run", "./cmd/agent"], cwd=repo, timeout=300)
+        # Build the shared agent, then ask it for its capability document
+        # (`agent caps`: no enrollment, no network I/O, exits immediately).
+        binary = agent_binary(repo, cfg)
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        code, out = run(["go", "build", "-o", str(binary), "./cmd/agent"],
+                        cwd=repo, timeout=900)
         if code != 0:
-            log.warning("Agent capability dump failed (build or toolchain issue).")
+            log.warning("Agent build failed: %s", out[-800:])
         else:
-            try:
-                caps = json.loads(out[out.index("{"):out.rindex("}") + 1])["caps"]
-                log.info("Agent caps: os=%s arch=%s gpu=%s encoders=%s docker=%s tailscale=%s",
-                         caps.get("os"), caps.get("arch"), (caps.get("gpu") or {}).get("model") or "none",
-                         ",".join(caps.get("encoders") or []) or "none",
-                         caps.get("docker"), caps.get("tailscale"))
-            except Exception:
-                log.warning("Could not parse agent caps output.")
+            # Generous timeout: first execution of a fresh binary can stall
+            # under antivirus real-time scanning (observed >60 s on Windows).
+            code, out = run([str(binary), "caps"], timeout=300)
+            if code != 0:
+                log.warning("Agent capability dump failed (exit %d): %s", code, out[-300:])
+            else:
+                try:
+                    caps = json.loads(out[out.index("{"):out.rindex("}") + 1])["caps"]
+                    log.info("Agent caps: os=%s arch=%s gpu=%s encoders=%s docker=%s tailscale=%s",
+                             caps.get("os"), caps.get("arch"), (caps.get("gpu") or {}).get("model") or "none",
+                             ",".join(caps.get("encoders") or []) or "none",
+                             caps.get("docker"), caps.get("tailscale"))
+                except Exception:
+                    log.warning("Could not parse agent caps output.")
     control_reachable(cfg["CONTROL_PLANE_URL"])
     streaming = str(cfg.get("STREAMING_ALLOWED", "false")).lower() in ("1", "true", "yes", "on")
     log.info("Streaming allowed: %s", streaming)
@@ -356,7 +374,12 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def agent_binary(repo: Path, cfg: dict) -> Path:
-    return Path(cfg["WORK_ROOT"]) / "bin" / "agent"
+    # Platform-correct name: Windows executables MUST carry .exe (an
+    # extension-less PE makes CreateProcess semantics flaky — observed as
+    # intermittent FileNotFoundError / AV-scan timeouts); Linux/Kaggle keeps
+    # the plain name.
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(cfg["WORK_ROOT"]) / "bin" / ("agent" + suffix)
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -581,6 +604,11 @@ def resolve_runner_argv(argv=None):
 
 def main(argv=None) -> int:
     resolved, notebook_mode = resolve_runner_argv(argv)
+    if notebook_mode:
+        # Paste-one-cell default: the project's public repo so a fresh
+        # kernel can clone + report real agent caps with zero setup.
+        # Explicit env / later explicit argv still win.
+        os.environ.setdefault("GITHUB_REPO_URL", DEFAULT_REPO_URL)
     parser = build_parser()
     args = parser.parse_args(resolved)
     setup_logging(args.verbose)

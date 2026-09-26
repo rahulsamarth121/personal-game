@@ -6,6 +6,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -34,6 +35,11 @@ type Server struct {
 	cmdMu    sync.Mutex
 	commands map[string][]NodeCommandReq // nodeID -> pending commands
 	cmdSeq   uint64
+
+	// EnrollToken, when set, is required (constant-time compare) in every
+	// EnrollRequest. Empty keeps the open local-dev behavior — same policy
+	// as the client API token. Never logged, never echoed in responses.
+	EnrollToken string
 }
 
 // NodeCommandReq is one queued instruction for a node agent. Agents poll
@@ -62,6 +68,7 @@ func NewWithSessions(cat *catalog.Registry, n *nodes.Registry, mgr *session.Mana
 func NewFull(cat *catalog.Registry, n *nodes.Registry, mgr *session.Manager, sm *saves.Manager) *Server {
 	s := &Server{Catalog: cat, Nodes: n, Sessions: mgr, Saves: sm,
 		mux: http.NewServeMux(), commands: map[string][]NodeCommandReq{}}
+	s.EnrollToken = os.Getenv("PG_ENROLL_TOKEN")
 	s.Saves.OnCommitted = mgr.NoteSaveGen
 	s.mux.HandleFunc("/healthz", s.healthz)
 	s.mux.HandleFunc("/v1/games", s.games)
@@ -194,6 +201,13 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	if req.NodeID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
 		return
+	}
+	if s.EnrollToken != "" {
+		presented := req.EnrollToken
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(s.EnrollToken)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid enrollment token"})
+			return
+		}
 	}
 	n, prev := s.Nodes.Enroll(req.NodeID, req.Caps)
 	if prev != 0 {

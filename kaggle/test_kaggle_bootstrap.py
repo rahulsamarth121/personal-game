@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import threading
@@ -406,3 +407,90 @@ def test_cli_help_exposes_all_flags():
     for flag in ("--api-token", "--streaming-allowed", "--media-network",
                  "--media-endpoint", "--control-plane-url", "--repo-url"):
         assert flag in proc.stdout, flag
+
+
+# --------------------------------------------------------------------------
+# pipeline: clone -> discovery -> build -> caps (Phases 3/4/5 of the audit)
+# --------------------------------------------------------------------------
+
+def test_clone_failure_is_clear_and_offline(tmp_path, monkeypatch):
+    """A bad repo URL fails fast with a useful error — no partial state,
+    no credential files left behind, no hang.
+    """
+    env = dict(os.environ,
+               WORK_ROOT=str(tmp_path),
+               GITHUB_REPO_URL="file:///nonexistent/pg-does-not-exist.git")
+    env.pop("GITHUB_TOKEN", None)
+    proc = subprocess.run([sys.executable, str(RUNNER), "clone"], env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 1
+    assert "Clone failed" in (proc.stdout + proc.stderr)
+    assert not (tmp_path / ".pg_tok").exists()
+    assert not (tmp_path / ".pg_askpass.sh").exists()
+
+
+def test_pipeline_clone_discover_build_caps(tmp_path):
+    """The exact Kaggle pipeline against a local bare origin (no network):
+    clone -> find_repo -> go build ./cmd/agent -> `agent caps` dump via
+    diagnostics. Requires the Go toolchain (present in dev; skipped here if
+    absent — Kaggle installs its own).
+    """
+    if shutil.which("go") is None:
+        pytest.skip("Go toolchain not available on this machine")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "--bare", "--quiet", str(HERE.parent),
+                    str(origin)], check=True)
+    # Work root holds the built agent binary (~20 MB); honor PG_TEST_WORKROOT
+    # so constrained-CI machines can point it at a roomy volume.
+    work = Path(os.environ["PG_TEST_WORKROOT"]) if os.environ.get("PG_TEST_WORKROOT") \
+        else tmp_path / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ,
+               WORK_ROOT=str(work),
+               GITHUB_REPO_URL=str(origin),
+               # deliberately unreachable: diagnostics must still exit 0 and
+               # report honestly (health failure is a warning, not a crash)
+               CONTROL_PLANE_URL="http://127.0.0.1:9",
+               STREAMING_ALLOWED="false")
+    env.pop("GITHUB_TOKEN", None)
+    # Keep the Go build cache on a volume with real free space; the repo's
+    # dev machine runs with a nearly-full system drive (documented env quirk).
+    if os.environ.get("PG_TEST_GOCACHE"):
+        cache_dir = os.environ["PG_TEST_GOCACHE"]
+        os.makedirs(cache_dir, exist_ok=True)
+        env["GOCACHE"] = cache_dir
+    clone = subprocess.run([sys.executable, str(RUNNER), "clone"], env=env,
+                           capture_output=True, text=True, timeout=300)
+    assert clone.returncode == 0, clone.stderr[-500:]
+    diag = subprocess.run([sys.executable, str(RUNNER), "diagnostics"], env=env,
+                          capture_output=True, text=True, timeout=600)
+    out = diag.stdout + diag.stderr
+    assert diag.returncode == 0, out[-800:]
+    assert "Agent caps:" in out, "diagnostics did not dump real agent capabilities"
+    assert "os=windows" in out or "os=linux" in out
+    # The built agent binary lives in the work root, next to the clone.
+    assert (work / "bin" / "agent").exists() or (work / "bin" / "agent.exe").exists()
+
+
+def test_notebook_default_repo_is_project_public_url(monkeypatch, _runner):
+    """Paste-one-cell mode points GITHUB_REPO_URL at the project's public
+    repo (via setdefault, so explicit operator config still wins)."""
+    fake = types.ModuleType("IPython")
+
+    class _FakeKernelShell:
+        pass
+
+    fake.get_ipython = lambda: _FakeKernelShell()
+    monkeypatch.setitem(sys.modules, "IPython", fake)
+    monkeypatch.setattr(sys, "argv", KERNEL_ARGV)
+    monkeypatch.delenv("GITHUB_REPO_URL", raising=False)
+    monkeypatch.setenv("WORK_ROOT", str(tmp_dir_factory()))
+    # main() runs diagnostics; the repo will not exist -> harmless warning.
+    rc = _runner.main()
+    assert rc == 0
+    assert os.environ["GITHUB_REPO_URL"] == _runner.DEFAULT_REPO_URL
+
+
+def tmp_dir_factory():
+    import tempfile
+    return tempfile.mkdtemp(prefix="pg_nb_default_")

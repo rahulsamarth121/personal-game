@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -16,6 +17,7 @@ type ControlConfig struct {
 	R2Bucket    string
 	AuthIssuer  string
 	APIToken    string
+	EnrollToken string // required on /v1/nodes/enroll when set (node credential)
 }
 
 // AgentConfig configures the node agent process. GAME_ROOT/TEMP_ROOT let
@@ -57,6 +59,7 @@ func LoadControlConfig() ControlConfig {
 		R2Bucket:    getenv("PG_R2_BUCKET", "personal-game-saves"),
 		AuthIssuer:  getenv("PG_AUTH_ISSUER", "personal-game"),
 		APIToken:    os.Getenv("PG_API_TOKEN"),
+		EnrollToken: os.Getenv("PG_ENROLL_TOKEN"),
 	}
 }
 
@@ -164,6 +167,9 @@ func (c AgentConfig) Validate() error {
 	}
 	if c.DataDir == "" {
 		return fmt.Errorf("agent: PG_DATA_DIR empty")
+	}
+	if c.ControlURL != "" && !strings.Contains(c.ControlURL, "://") {
+		return fmt.Errorf("agent: PG_CONTROL_URL must include a scheme (http:// or https://), got %q", c.ControlURL)
 	}
 	if c.LeaseTTL <= 0 || c.HeartbeatInt <= 0 {
 		return fmt.Errorf("agent: lease/heartbeat durations must be positive, got %v/%v", c.LeaseTTL, c.HeartbeatInt)

@@ -22,9 +22,39 @@ import (
 	"github.com/personal-game/personal-game/internal/agent/session"
 	"github.com/personal-game/personal-game/internal/agent/stream"
 	"github.com/personal-game/personal-game/internal/common"
+	"github.com/personal-game/personal-game/pkg/protocol"
 )
 
+// capsDocument renders the agent's capability report as JSON with the
+// same shape the control plane stores from EnrollRequest ("caps" key).
+func capsDocument() (string, error) {
+	out, err := json.MarshalIndent(struct {
+		Caps protocol.Capabilities `json:"caps"`
+	}{capability.Discover()}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// printCaps writes the capability document to stdout; exit 0 on success.
+func printCaps() int {
+	doc, err := capsDocument()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agent: capability marshal failed:", err)
+		return 1
+	}
+	fmt.Println(doc)
+	return 0
+}
+
 func main() {
+	// `agent caps` prints the capability document and exits — used by the
+	// Kaggle runner's diagnostics and by operators checking a host. It
+	// performs NO enrollment and NO network I/O.
+	if len(os.Args) == 2 && os.Args[1] == "caps" {
+		os.Exit(printCaps())
+	}
 	cfg, err := common.LoadAgentConfig()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agent: invalid config:", err)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/personal-game/personal-game/pkg/protocol"
@@ -24,12 +25,18 @@ var ErrFenced = errors.New("session: fenced by control plane")
 // Control is a minimal control-plane client for the session flow.
 type Control struct {
 	BaseURL string
-	HTTP    *http.Client
+	// APIToken, when set, is sent as `Authorization: Bearer <token>` on
+	// every call: GetSession/manifest/observe/stream/saves are client-API
+	// routes that the control plane 401s when PG_API_TOKEN is configured.
+	// The value is never logged and never appears in URLs.
+	APIToken string
+	HTTP     *http.Client
 }
 
 // NewControl builds a client with a sane timeout.
 func NewControl(baseURL string) *Control {
-	return &Control{BaseURL: baseURL, HTTP: &http.Client{Timeout: 30 * time.Second}}
+	return &Control{BaseURL: baseURL, APIToken: os.Getenv("PG_API_TOKEN"),
+		HTTP: &http.Client{Timeout: 30 * time.Second}}
 }
 
 func (c *Control) post(ctx context.Context, path string, body, out any) error {
@@ -55,6 +62,11 @@ func (c *Control) do(ctx context.Context, method, path string, body, out any) er
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.APIToken != "" {
+		// Client-API bearer auth. Header-only: never a query parameter,
+		// never logged (errors carry method+path+status only).
+		req.Header.Set("Authorization", "Bearer "+c.APIToken)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
