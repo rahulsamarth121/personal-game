@@ -28,8 +28,11 @@ All logic lives there; this notebook only bootstraps a fresh kernel.
 
 **Flow:** fresh kernel → Cell 1 loads Secrets and safely clones the repo
 (token served through a temporary git askpass helper — never in URLs,
-command lines, or printed output) → then the canonical runner does
-diagnostics → setup → run.
+command lines, or printed output) → every runner command runs as a real
+**subprocess** (`subprocess.run([sys.executable, runner, cmd], check=True)`),
+so the runner parses only its own CLI arguments — never the kernel's
+`sys.argv` (which holds a `kernel-*.json` connection file). No `%run`, no
+in-process execution; all logic stays in the one canonical runner.
 
 **Streaming policy:** this environment advertises `STREAMING_ALLOWED=false`
 by default — Kaggle's AUP forbids game streaming, so the scheduler will
@@ -102,17 +105,29 @@ assert RUNNER.exists(), "canonical runner missing: " + str(RUNNER)
 print("Bootstrap OK — runner:", RUNNER)
 """
 
-CELL2 = """# CELL 2 — Diagnostics (honest capability report + control-plane reachability)
-!python {RUNNER} diagnostics""".format(RUNNER=RUNNER_PATH)
+CELL2 = """# CELL 2 — Diagnostics: the canonical runner runs as a REAL SUBPROCESS,
+# so argparse parses only the arguments in this list — never Jupyter's own
+# kernel sys.argv (which contains a kernel-*.json connection file).
+import subprocess
+import sys
+subprocess.run([sys.executable, "{RUNNER}", "diagnostics"], check=True)""".format(RUNNER=RUNNER_PATH)
 
-CELL3 = """# CELL 3 — Setup (Go toolchain check + shared agent build, idempotent)
-!python {RUNNER} setup""".format(RUNNER=RUNNER_PATH)
+CELL3 = """# CELL 3 — Setup (Go toolchain check + shared agent build, idempotent),
+# again as a real subprocess with only its own CLI arguments.
+import subprocess
+import sys
+subprocess.run([sys.executable, "{RUNNER}", "setup"], check=True)""".format(RUNNER=RUNNER_PATH)
 
-CELL4 = """# CELL 4 — Run the shared node agent (foreground; interrupt the cell to stop)
-!python {RUNNER} run""".format(RUNNER=RUNNER_PATH)
+CELL4 = """# CELL 4 — Run the shared node agent (foreground). Real subprocess; the
+# runner handles Ctrl+C itself — interrupt the cell to stop the node.
+import subprocess
+import sys
+subprocess.run([sys.executable, "{RUNNER}", "run"], check=True)""".format(RUNNER=RUNNER_PATH)
 
-CELL5 = """# CELL 5 — Cleanup (ephemeral staging only, never saves)
-!python {RUNNER} cleanup""".format(RUNNER=RUNNER_PATH)
+CELL5 = """# CELL 5 — Cleanup (ephemeral staging only, never saves).
+import subprocess
+import sys
+subprocess.run([sys.executable, "{RUNNER}", "cleanup"], check=True)""".format(RUNNER=RUNNER_PATH)
 
 
 def code(src: str) -> dict:

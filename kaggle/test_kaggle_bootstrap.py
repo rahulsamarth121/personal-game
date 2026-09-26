@@ -56,6 +56,36 @@ def test_notebook_never_embeds_token_in_clone_url(cells):
     assert "GITHUB_TOKEN@" not in src and "x-access-token@" not in src
 
 
+def test_notebook_runner_cells_are_subprocess_calls(cells):
+    """Regression: runner commands must run as REAL SUBPROCESSes.
+
+    In-process execution (%run or importlib) makes argparse consume the
+    kernel's own sys.argv (kernel-*.json connection file) — the exact
+    colab failure this guard prevents. Every runner cell must therefore
+    call `subprocess.run([sys.executable, runner, cmd], check=True)`.
+    """
+    for cell in cells[1:]:
+        assert "%run" not in cell["source"], "notebook must not use %run"
+        assert "!python" not in cell["source"], "use subprocess.run, not shell magic"
+    for cell in cells[2:]:
+        assert "subprocess.run([sys.executable," in cell["source"]
+        assert "check=True" in cell["source"]
+
+
+def test_main_uses_only_passed_argv(monkeypatch, tmp_path, _runner, capsys):
+    """Programmatic main([...]) parses ONLY its argument list — never the
+    kernel's sys.argv — so tests can import and call the runner safely.
+    """
+    monkeypatch.setenv("WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv",
+                        ["colab_kernel_launcher.py", "-f", "/tmp/kernel-xyz.json"])
+    rc = _runner.main(["cleanup"])  # explicit argv: kernel argv must be ignored
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "kernel-xyz.json" not in out
+    assert "invalid choice" not in out
+
+
 def test_notebook_bootstrap_on_fresh_kernel(tmp_path, monkeypatch, cells):
     """Execute Cell 1 with rewritten paths against a local bare 'origin'."""
     work = tmp_path / "work"
