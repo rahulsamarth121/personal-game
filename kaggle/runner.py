@@ -16,10 +16,12 @@ Secrets are never printed. Idempotent: reruns skip finished work.
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -139,14 +141,45 @@ def repo_dir(cfg: dict) -> Path:
     return Path(cfg["WORK_ROOT"]) / "repo"
 
 
-def run(cmd, cwd=None, timeout=120, check_text=True):
+def run(cmd, cwd=None, timeout=120, check_text=True, env=None):
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              timeout=timeout, env=env)
         return proc.returncode, redact((proc.stdout or "") + (proc.stderr or ""))
     except FileNotFoundError:
         return 127, f"not found: {cmd[0]}"
     except subprocess.TimeoutExpired:
         return 124, f"timed out: {' '.join(cmd)}"
+
+
+@contextlib.contextmanager
+def git_auth_env(cfg: dict):
+    """Private-repo auth for git subprocesses via a temporary askpass helper.
+
+    When the GITHUB_TOKEN secret is set, it is written to a 0600 temp file
+    read by a tiny askpass script (mirroring the notebook bootstrap): the
+    token never appears in the Git URL or the command line, and both files
+    are deleted when the block exits — even on failure. Yields an env dict
+    for run(..., env=...), or {} when no token is configured (public repos
+    or pre-authenticated environments).
+    """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    tokfile = Path(cfg["WORK_ROOT"]) / ".pg_tok"
+    askpass = Path(cfg["WORK_ROOT"]) / ".pg_askpass.sh"
+    if not token:
+        yield {}
+        return
+    tokfile.parent.mkdir(parents=True, exist_ok=True)
+    tokfile.write_text(token)
+    try:
+        tokfile.chmod(0o600)
+        askpass.write_text("#!/bin/sh\ncase \"$1\" in Username*) echo personal-game ;; "
+                           "*) cat " + shlex.quote(str(tokfile)) + " ;; esac\n")
+        askpass.chmod(0o755)
+        yield dict(os.environ, GIT_ASKPASS=str(askpass), GIT_TERMINAL_PROMPT="0")
+    finally:
+        askpass.unlink(missing_ok=True)
+        tokfile.unlink(missing_ok=True)
 
 
 def cmd_clone(args: argparse.Namespace) -> int:
@@ -161,8 +194,9 @@ def cmd_clone(args: argparse.Namespace) -> int:
         return 1
     if not dest.exists():
         log.info("Cloning %s (branch %s)...", cfg["GITHUB_REPO_URL"], cfg["GITHUB_BRANCH"])
-        code, out = run(["git", "clone", "--branch", cfg["GITHUB_BRANCH"], "--depth", "1",
-                         cfg["GITHUB_REPO_URL"], str(dest)], timeout=600)
+        with git_auth_env(cfg) as auth_env:
+            code, out = run(["git", "clone", "--branch", cfg["GITHUB_BRANCH"], "--depth", "1",
+                             cfg["GITHUB_REPO_URL"], str(dest)], timeout=600, env=auth_env or None)
         if code != 0:
             log.error("Clone failed: %s", out[-2000:])
             return 1
@@ -177,7 +211,8 @@ def cmd_clone(args: argparse.Namespace) -> int:
         log.warning("Repo has local changes; skipping pull (use --update-repo always to override).")
         return 0
     log.info("Updating repo (fast-forward only)...")
-    code, out = run(["git", "pull", "--ff-only"], cwd=dest, timeout=300)
+    with git_auth_env(cfg) as auth_env:
+        code, out = run(["git", "pull", "--ff-only"], cwd=dest, timeout=300, env=auth_env or None)
     if code != 0:
         log.warning("Pull skipped/failed (keeping current checkout): %s", out[-1000:])
         return 0

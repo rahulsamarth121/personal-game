@@ -8,6 +8,7 @@ the deployed Worker are run separately (see kaggle/README.md).
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -89,6 +90,33 @@ def test_notebook_bootstrap_on_fresh_kernel(tmp_path, monkeypatch, cells):
     finally:
         os.environ.clear()
         os.environ.update(snapshot)
+
+
+def test_runner_clone_private_repo_temp_askpass_cleanup(tmp_path, monkeypatch, _runner):
+    """runner.py clone with GITHUB_TOKEN: temp askpass is used for the git
+    subprocess, the token never appears in the URL/argv, and both credential
+    files are deleted afterwards — even though the clone target is local.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "--bare", "--quiet", str(HERE.parent),
+                    str(origin)], check=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake_token_for_local_test_1234567890")
+    monkeypatch.setenv("WORK_ROOT", str(work))
+    monkeypatch.setenv("GITHUB_REPO_URL", str(origin))
+    args = argparse.Namespace(repo_url=None, branch=None, work_root=None,
+                              update_repo=None)
+    assert _runner.cmd_clone(args) == 0
+    repo = work / "repo"
+    assert (repo / ".git").exists()
+    assert (repo / "kaggle" / "runner.py").exists()
+    assert not (work / ".pg_tok").exists(), "token file survived the clone"
+    assert not (work / ".pg_askpass.sh").exists(), "askpass survived the clone"
+    # Idempotent rerun: repo present, fast-forward pull, still no leftovers.
+    assert _runner.cmd_clone(args) == 0
+    assert not (work / ".pg_tok").exists()
+    assert not (work / ".pg_askpass.sh").exists()
 
 
 # --------------------------------------------------------------------------
