@@ -30,19 +30,21 @@ opaquely to the Go API (which enforces `PG_API_TOKEN`) and never logged.
 
 ## Configure
 
-Set the one required variable (`wrangler.toml [vars]`, or
-`wrangler secret put CONTROL_PLANE_ORIGIN` to keep it out of the file):
+The origin is configured as a Worker **secret** — never in `wrangler.toml`:
 
-```toml
-[vars]
-CONTROL_PLANE_ORIGIN = "https://your-control-plane-hostname"
+```bash
+cd deploy/cloudflare-worker
+npx wrangler secret put CONTROL_PLANE_ORIGIN
+# paste the durable, reachable control-plane hostname at the prompt
 ```
 
-The origin must be reachable from Cloudflare's network: a public HTTPS
-hostname (e.g. a Cloudflare Tunnel `cloudflared` hostname in front of the
-Go control plane), or a Cloudflare-connected private origin. `127.0.0.1`
-on your Windows machine is not remotely reachable — the Worker will report
-`upstream: unreachable` rather than pretend.
+The origin must be reachable from Cloudflare's network: a **durable**
+public HTTPS hostname (e.g. a Cloudflare Tunnel `cloudflared` hostname in
+front of the Go control plane), or a Cloudflare-connected private origin.
+It must not be a temporary/ephemeral hostname (e.g. a quick
+`trycloudflare.com` tunnel) — quick tunnels disappear when the process
+dies. `127.0.0.1` on your Windows machine is not remotely reachable — the
+Worker will report `upstream: unreachable` rather than pretend.
 
 ## Deployed instance
 
@@ -51,6 +53,7 @@ on your Windows machine is not remotely reachable — the Worker will report
 | Worker name | `personal-game-relay` |
 | URL | `https://personal-game-relay.rahul-zed-relay-84739261.workers.dev` |
 | Account | authenticated via local `wrangler login` (OAuth; no tokens in git) |
+| Origin config | `CONTROL_PLANE_ORIGIN` Worker **secret** (`wrangler secret put`) — no origin hostname is committed |
 
 The user's pre-existing `zed-relay-test` Worker serves an unrelated,
 authenticated ZED relay. It is **not** this project's Worker and must not

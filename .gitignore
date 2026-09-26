@@ -1,9 +1,14 @@
+# Secrets & local config
 .env
 .env.*
 !.env.example
-data/
+
+# Runtime data & logs (repo-root only; never ignore source trees)
+/data/
+/logs/
 *.log
-logs/
+
+# Build artifacts
 *.exe
 *.msi
 *.iso
@@ -11,22 +16,35 @@ logs/
 *.rar
 *.7z
 *.bin
-bin/
-dist/
+/bin/
+/dist/
 *.agdai
-agent
-agent.exe
-controlplane
-controlplane.exe
-saves/
+
+# Compiled binaries placed at the repo root by local builds
+/agent
+/agent.exe
+/controlplane
+/controlplane.exe
+
+# Game saves (runtime output, never source)
+/saves/
 *.sav
+
+# OS / editor noise
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# Python caches
 __pycache__/
 .ipynb_checkpoints/
+.pytest_cache/
+
+# Runner-local config
 kaggle/runner/config/.env
+
+# Node modules (none committed)
 node_modules/
 
 # Cloudflare Worker local state (account cache, deploy tmp) — never commit

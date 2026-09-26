@@ -24,9 +24,15 @@ NODE_NAME=gpu-1
 STREAMING_ALLOWED=true      # ONLY where the infrastructure permits game streaming
 MEDIA_NETWORK=tailscale     # or cloudflare_private_network | direct
 MEDIA_ENDPOINT=172.16.9.9   # required for cloudflare/direct
+PG_SAVE_ROOTS=/srv/game-data  # optional: extra save roots outside the home volume (path-list)
 ```
 
 `STREAMING_ALLOWED` is an operator policy bit, not a capability lie: the
 scheduler skips nodes without it, whatever the hardware. See
 `docs/operations/media-networks.md` for the provider model and the
 Cloudflare private-network path.
+
+`PG_SAVE_ROOTS` (optional, path-list separated) declares extra directories
+the agent may treat as save roots when game/save data legitimately lives
+outside the user's home volume — e.g. a portable-save work area on another
+drive. It widens the approved set explicitly; it never bypasses validation.

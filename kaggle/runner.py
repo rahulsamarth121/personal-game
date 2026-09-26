@@ -52,9 +52,30 @@ DEFAULTS = {
     "UPDATE_REPO": "auto",  # auto|always|never
 }
 
-SECRET_KEYS = {"NODE_ENROLLMENT_TOKEN", "PG_API_TOKEN"}
+SECRET_KEYS = {"GITHUB_TOKEN", "NODE_ENROLLMENT_TOKEN", "PG_API_TOKEN"}
+
+
+def redact(text: str) -> str:
+    """Mask configured secret values before text reaches logs or output."""
+    for value in (os.environ.get(k, "") for k in SECRET_KEYS):
+        if value and len(value) >= 8:
+            text = text.replace(value, "[REDACTED]")
+    return text
 
 log = logging.getLogger("kaggle-runner")
+
+# Cloudflare's bot protection on *.workers.dev rejects the default
+# "Python-urllib/x.y" User-Agent (HTML error 1010), so every health probe
+# identifies itself explicitly. (The Go agent already sends Go-http-client,
+# which is allowed.)
+USER_AGENT = "personal-game-kaggle-runner/1.0"
+
+
+def _http_get(url: str, timeout: int = 10):
+    """GET with an identifying User-Agent; returns (status, body) or raises."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode("utf-8", "replace")
 
 
 def setup_logging(verbose: bool) -> None:
@@ -121,7 +142,7 @@ def repo_dir(cfg: dict) -> Path:
 def run(cmd, cwd=None, timeout=120, check_text=True):
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, redact((proc.stdout or "") + (proc.stderr or ""))
     except FileNotFoundError:
         return 127, f"not found: {cmd[0]}"
     except subprocess.TimeoutExpired:
@@ -200,12 +221,52 @@ def disk_free(path: Path) -> int:
         return 0
 
 
-def control_reachable(url: str) -> bool:
+def _worker_health_ok(url: str) -> bool:
+    """True only when a Personal Game Worker relay is fully healthy.
+
+    The relay's /health must return HTTP 200 AND its JSON body must report
+    both ``relay=ok`` and ``upstream=ok``. A 200 with a degraded upstream is
+    NOT reachable — health is verified, never assumed.
+    """
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/healthz", timeout=10) as resp:
-            return resp.status == 200
+        status, body = _http_get(url, timeout=10)
     except Exception as exc:
-        log.warning("Control plane unreachable at %s: %s", url, exc)
+        log.debug("No Worker-style health at %s: %s", url, exc)
+        return False
+    if status != 200:
+        return False
+    try:
+        health = json.loads(body)
+    except ValueError:
+        log.debug("/health at %s returned non-JSON body", url)
+        return False
+    if health.get("relay") == "ok" and health.get("upstream") == "ok":
+        log.info("Worker relay healthy: %s (upstream: ok)", url)
+        return True
+    log.warning("Worker relay responded but is not fully healthy: %s", body.strip()[:200])
+    return False
+
+
+def control_reachable(url: str) -> bool:
+    """Health-check the configured control plane. Two supported shapes:
+
+    * Personal Game Worker relay (``.../personal-game``): probe ``/health``
+      and require JSON ``relay=ok`` + ``upstream=ok``.
+    * Direct Go control plane: probe ``/healthz`` (HTTP 200).
+
+    Failure of either probe is reported honestly; success is never faked.
+    """
+    base = url.rstrip("/")
+    if _worker_health_ok(base + "/health"):
+        return True
+    try:
+        status, _ = _http_get(base + "/healthz", timeout=10)
+        if status == 200:
+            log.info("Control plane reachable: %s/healthz", base)
+            return True
+        return False
+    except Exception as exc:
+        log.warning("Control plane unreachable at %s (tried /health and /healthz): %s", base, exc)
         return False
 
 

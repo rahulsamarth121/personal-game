@@ -121,7 +121,14 @@ func mkzip(files map[string][]byte) []byte {
 
 func setupWorld(t *testing.T) *world {
 	t.Helper()
+	// Keep the suite hermetic wherever t.TempDir() points (it follows
+	// GOTMPDIR, which may be another volume than home): the node's save
+	// guard approves home plus operator-declared roots (PG_SAVE_ROOTS),
+	// so the fixture's save areas are declared explicitly here — exactly
+	// what a real node operator does. Later runs use further t.TempDir()
+	// siblings, so declare their shared parent.
 	base := t.TempDir()
+	t.Setenv("PG_SAVE_ROOTS", filepath.Dir(base))
 	// Fixture game: zip with executable + data, served via file:// URL.
 	gameZip := mkzip(map[string][]byte{"game.exe": []byte("exe"), "data/x.dat": []byte("x")})
 	zipPath := filepath.Join(base, "game.zip")

@@ -14,10 +14,15 @@ repo, diagnoses capabilities honestly, builds the **shared** Go agent
 ## Run
 
 ```bash
-python kaggle/runner.py all --repo-url https://github.com/YOU/personal-game.git
+python kaggle/runner.py all --repo-url https://github.com/rahulsamarth121/personal-game.git
 # stepwise:
 python kaggle/runner.py clone | diagnostics | setup | run | cleanup
 ```
+
+On a completely fresh Kaggle kernel, run notebook cell 1 first
+(`kaggle/notebook/personal_game.ipynb`): it loads Secrets, clones the
+repository safely, and executes this runner. The repository must exist
+before the runner is invoked — it cannot bootstrap itself from nothing.
 
 On startup it prints the node banner and status (never secrets):
 
@@ -35,6 +40,7 @@ Media:           provider-neutral
 
 | variable | purpose |
 |---|---|
+| `GITHUB_TOKEN` | fine-grained PAT (**secret**) with read access to the private repo — used by `clone` and by the notebook bootstrap; never printed |
 | `CONTROL_PLANE_URL` | control-plane base URL. Default: `https://personal-game-relay.rahul-zed-relay-84739261.workers.dev/personal-game` |
 | `PG_API_TOKEN` | client-API bearer token (**secret**) if the plane requires one |
 | `NODE_ENROLLMENT_TOKEN` | node enrollment credential (**secret**) |
@@ -48,7 +54,9 @@ on Kaggle so tokens never appear in notebook output or logs.
 
 ## Registration & verification
 
-1. `clone` — fetches the repo into the work root.
+1. `clone` — fetches the repo into the work root (private repo: set the
+   `GITHUB_TOKEN` secret; the token is served via a temporary git askpass
+   helper and is never embedded in URLs or printed).
 2. `diagnostics` — honest capability report: GPU, encoders, disk, tools,
    control-plane reachability, streaming policy, media network.
 3. `setup` — installs/uses the Go toolchain and builds `cmd/agent`.

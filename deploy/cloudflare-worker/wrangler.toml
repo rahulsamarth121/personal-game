@@ -4,26 +4,26 @@
 # `zed-relay-test` Worker serves an unrelated, authenticated ZED relay and
 # was NOT modified). This is a separate deployment in the same account.
 #
-# CONTROL_PLANE_ORIGIN must point at a *reachable* Go control plane
-# (public HTTPS, or a Cloudflare-connected private origin). A Worker can
-# never reach 127.0.0.1 on someone else's machine — do not set it to
-# localhost unless this Worker is only being tested against a local
-# origin via `wrangler dev` (where loopback IS the same machine).
+# CONTROL_PLANE_ORIGIN (the durable, reachable control-plane hostname the
+# relay forwards /personal-game/* to) is deliberately NOT set in this file.
+# Configure it as a Worker secret so no origin hostname is committed:
 #
-# No secret is required in development mode. The Go control plane's
-# PG_API_TOKEN continues to protect the API itself; Authorization headers
-# are forwarded opaquely.
+#     cd deploy/cloudflare-worker
+#     npx wrangler secret put CONTROL_PLANE_ORIGIN
+#
+# Paste the durable control-plane origin at the prompt. It must be a
+# hostname reachable from Cloudflare's network (for example a Cloudflare
+# Tunnel hostname in front of the Go control plane) — never localhost.
+# Changing the secret rolls out a new Worker version automatically; no
+# redeploy is needed. Temporary/ephemeral hostnames (e.g. quick
+# trycloudflare.com tunnels) must never be committed here — set them as
+# secrets only, and replace them with a durable origin for real use.
 
 name = "personal-game-relay"
 main = "worker.js"
 compatibility_date = "2025-05-01"
 
-[vars]
-# Development/testing: replace with your real control-plane origin.
-# Example for a LAN/Tailscale-exposed HTTPS origin or a Cloudflare
-# Tunnel hostname:
-CONTROL_PLANE_ORIGIN = "https://cape-services-double-soccer.trycloudflare.com"
-# RELAY_MAX_BODY_BYTES = "10485760"
+# CONTROL_PLANE_ORIGIN is a secret (wrangler secret put), not a [vars] entry.
 
 # Observability: minimal, never logs Authorization values.
 [observability]

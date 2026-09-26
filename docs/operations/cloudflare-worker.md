@@ -69,18 +69,22 @@ Three distinct states, never conflated:
 
 ```bash
 cd deploy/cloudflare-worker
-# set the real upstream in wrangler.toml [vars], or keep it out of git:
+# keep the upstream hostname out of git — configure it as a secret:
 npx wrangler secret put CONTROL_PLANE_ORIGIN   # e.g. https://control.example.com
 npx wrangler deploy
 ```
 
-The upstream must be reachable **from Cloudflare's edge**: a public HTTPS
-hostname (e.g. `cloudflared` tunnel hostname in front of the Go control
-plane) or a Cloudflare-connected private origin. `127.0.0.1` on your own
+`wrangler.toml` intentionally contains no `[vars]` origin — a temporary
+hostname (e.g. an ephemeral quick `trycloudflare.com` tunnel) must never
+look like permanent production configuration. The upstream must be
+reachable **from Cloudflare's edge** and **durable**: a Cloudflare Tunnel
+hostname in front of the Go control plane on a host you control, or a
+Cloudflare-connected private origin. `127.0.0.1` on your own
 machine is not remotely reachable — the Worker reports
 `upstream: unreachable` rather than pretending.
 
-Live-tested topology:
+Live-tested topology (origin is currently ephemeral — a documented gap,
+not production):
 
 ```
 Windows/nodes -> Worker -> cloudflared tunnel (quick tunnel) -> Go control plane
