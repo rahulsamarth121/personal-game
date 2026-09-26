@@ -1,0 +1,43 @@
+{
+  "schema_version": 3,
+  "game_id": "posted",
+  "name": "Posted",
+  "version": "1",
+  "acquisition": {
+    "provider": "archive",
+    "sources": [
+      {
+        "url": "https://example.invalid/g.exe",
+        "part": 1,
+        "filename": "g.exe"
+      }
+    ],
+    "package_type": "direct_prebuilt"
+  },
+  "footprint": {
+    "download_bytes": 0,
+    "peak_temp_bytes": 0,
+    "installed_bytes": 0,
+    "safety_headroom": 0
+  },
+  "cleanup": {
+    "delete_parts_after_archive_extract": false,
+    "delete_iso_after_extract": false,
+    "delete_installer_after_install": false,
+    "delete_archive_after_prebuilt_ready": false
+  },
+  "runtime": {
+    "os": ""
+  },
+  "launch": {
+    "executable": "g.exe"
+  },
+  "saves": {
+    "provider": ""
+  },
+  "capabilities_required": {
+    "gamepad": false,
+    "hdr": false,
+    "min_vram_mb": 0
+  }
+}

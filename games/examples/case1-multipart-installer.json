@@ -1,0 +1,37 @@
+{
+  "schema_version": 3,
+  "game_id": "case1-multipart-installer",
+  "name": "CASE 1: multipart ZIP parts -> ISO -> installer EXE -> installed game",
+  "version": "1.0",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "archive_installer",
+    "sources": [
+      {"url": "https://example.invalid/game.part01.zip", "part": 1, "filename": "game.part01.zip"},
+      {"url": "https://example.invalid/game.part02.zip", "part": 2, "filename": "game.part02.zip"}
+    ]
+  },
+  "footprint": {
+    "download_bytes": 42949672960,
+    "peak_temp_bytes": 42949672960,
+    "installed_bytes": 53687091200,
+    "safety_headroom": 5368709120,
+    "iso_bytes": 47244640256,
+    "installer_bytes": 2147483648
+  },
+  "package_pipeline": {
+    "archive": {"type": "zip", "multipart": true},
+    "result": {"type": "iso", "path": "game.iso"},
+    "iso": {"extract": true},
+    "installer": {"type": "exe", "path": "setup.exe", "arguments": ["/SILENT"], "timeout_seconds": 3600, "expected_dir": "Case1"}
+  },
+  "runtime": {"os": "windows"},
+  "launch": {"executable": "game.exe", "arguments": [], "working_directory": "."},
+  "cleanup": {
+    "delete_parts_after_archive_extract": true,
+    "delete_iso_after_extract": true,
+    "delete_installer_after_install": true
+  },
+  "saves": {"provider": "ludusavi", "overrides": []},
+  "capabilities_required": {"gamepad": false, "hdr": false, "min_vram_mb": 0}
+}

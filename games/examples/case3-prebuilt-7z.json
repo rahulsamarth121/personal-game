@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "game_id": "case3-prebuilt-7z-exe",
+  "name": "CASE 3: single archive -> extracted executable -> PLAY",
+  "version": "1.0",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "archive_prebuilt",
+    "sources": [
+      {"url": "https://example.invalid/small-game.7z", "part": 1, "filename": "small-game.7z"}
+    ]
+  },
+  "footprint": {
+    "download_bytes": 536870912,
+    "peak_temp_bytes": 536870912,
+    "installed_bytes": 805306368,
+    "safety_headroom": 134217728
+  },
+  "package_pipeline": {
+    "archive": {"type": "7z", "multipart": false},
+    "prebuilt": {"expected_files": ["small-game.exe"]}
+  },
+  "runtime": {"os": "windows"},
+  "launch": {"executable": "small-game.exe", "arguments": [], "working_directory": "."},
+  "cleanup": {"delete_archive_after_prebuilt_ready": true},
+  "saves": {"provider": "ludusavi", "overrides": []},
+  "capabilities_required": {"gamepad": false, "hdr": false, "min_vram_mb": 0}
+}

@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "game_id": "case2-prebuilt-zip",
+  "name": "CASE 2: single ZIP -> prebuilt game directory -> game.exe -> PLAY",
+  "version": "1.0",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "archive_prebuilt",
+    "sources": [
+      {"url": "https://example.invalid/prebuilt-game.zip", "part": 1, "filename": "prebuilt-game.zip"}
+    ]
+  },
+  "footprint": {
+    "download_bytes": 10737418240,
+    "peak_temp_bytes": 10737418240,
+    "installed_bytes": 11811160064,
+    "safety_headroom": 1073741824
+  },
+  "package_pipeline": {
+    "archive": {"type": "zip", "multipart": false},
+    "prebuilt": {"game_root": "", "expected_files": ["game.exe", "data/"]}
+  },
+  "runtime": {"os": "windows"},
+  "launch": {"executable": "game.exe", "arguments": [], "working_directory": "."},
+  "cleanup": {"delete_archive_after_prebuilt_ready": true},
+  "saves": {"provider": "ludusavi", "overrides": []},
+  "capabilities_required": {"gamepad": false, "hdr": false, "min_vram_mb": 0}
+}

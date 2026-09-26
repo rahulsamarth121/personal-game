@@ -1,0 +1,56 @@
+services:
+  controlplane:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.controlplane
+    ports: ["8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      PG_LISTEN_ADDR: :8080
+      PG_DATABASE_URL: postgres://pg:pg@postgres:5432/personal_game?sslmode=disable
+      PG_MANIFEST_DIR: /seed/manifests
+      # Object storage points at MinIO here (S3-compatible). For live R2,
+      # set R2_ACCOUNT_ID/R2_BUCKET/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY.
+      R2_ENDPOINT: http://minio:9000
+      R2_BUCKET: personal-game-saves
+      R2_ACCESS_KEY_ID: minioadmin
+      R2_SECRET_ACCESS_KEY: minioadmin
+      R2_REGION: us-east-1
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pg
+      POSTGRES_PASSWORD: pg
+      POSTGRES_DB: personal_game
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pg -d personal_game"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/data"]
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/personal-game-saves
+      "
+volumes:
+  pgdata: {}
+  miniodata: {}

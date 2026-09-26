@@ -1,0 +1,30 @@
+# Personal Game control-plane edge relay.
+#
+# The Worker name is intentionally unique (the user's existing
+# `zed-relay-test` Worker serves an unrelated, authenticated ZED relay and
+# was NOT modified). This is a separate deployment in the same account.
+#
+# CONTROL_PLANE_ORIGIN must point at a *reachable* Go control plane
+# (public HTTPS, or a Cloudflare-connected private origin). A Worker can
+# never reach 127.0.0.1 on someone else's machine — do not set it to
+# localhost unless this Worker is only being tested against a local
+# origin via `wrangler dev` (where loopback IS the same machine).
+#
+# No secret is required in development mode. The Go control plane's
+# PG_API_TOKEN continues to protect the API itself; Authorization headers
+# are forwarded opaquely.
+
+name = "personal-game-relay"
+main = "worker.js"
+compatibility_date = "2025-05-01"
+
+[vars]
+# Development/testing: replace with your real control-plane origin.
+# Example for a LAN/Tailscale-exposed HTTPS origin or a Cloudflare
+# Tunnel hostname:
+CONTROL_PLANE_ORIGIN = "https://cape-services-double-soccer.trycloudflare.com"
+# RELAY_MAX_BODY_BYTES = "10485760"
+
+# Observability: minimal, never logs Authorization values.
+[observability]
+enabled = false

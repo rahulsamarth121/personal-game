@@ -1,0 +1,55 @@
+{
+  "schema_version": 3,
+  "game_id": "test-game-local",
+  "name": "Local test game (user-supplied executable)",
+  "version": "0.1",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "direct_prebuilt",
+    "sources": [
+      {
+        "url": "file:///C:/personal-game-test/game.exe",
+        "part": 1,
+        "filename": "game.exe"
+      }
+    ]
+  },
+  "footprint": {
+    "download_bytes": 104857600,
+    "peak_temp_bytes": 0,
+    "installed_bytes": 104857600,
+    "safety_headroom": 104857600
+  },
+  "package_pipeline": {
+    "prebuilt": {
+      "game_root": "",
+      "expected_files": ["game.exe"]
+    }
+  },
+  "runtime": {
+    "os": "windows"
+  },
+  "launch": {
+    "executable": "game.exe",
+    "arguments": [],
+    "working_directory": ".",
+    "wolf_app": ""
+  },
+  "cleanup": {
+    "delete_archive_after_prebuilt_ready": true
+  },
+  "saves": {
+    "provider": "ludusavi",
+    "overrides": [
+      {
+        "platform": "windows",
+        "paths": ["%APPDATA%/test-game-local"]
+      }
+    ]
+  },
+  "capabilities_required": {
+    "gamepad": false,
+    "hdr": false,
+    "min_vram_mb": 0
+  }
+}

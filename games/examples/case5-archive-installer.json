@@ -1,0 +1,33 @@
+{
+  "schema_version": 3,
+  "game_id": "case5-archive-installer",
+  "name": "CASE 5: single archive -> installer EXE -> install -> PLAY",
+  "version": "1.0",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "archive_installer",
+    "sources": [
+      {"url": "https://example.invalid/setup-bundle.zip", "part": 1, "filename": "setup-bundle.zip"}
+    ]
+  },
+  "footprint": {
+    "download_bytes": 8589934592,
+    "peak_temp_bytes": 8589934592,
+    "installed_bytes": 12884901888,
+    "safety_headroom": 1073741824,
+    "iso_bytes": 0,
+    "installer_bytes": 1073741824
+  },
+  "package_pipeline": {
+    "archive": {"type": "zip", "multipart": false},
+    "installer": {"type": "exe", "path": "setup.exe", "arguments": ["/SILENT"], "timeout_seconds": 1800, "expected_dir": "Case5"}
+  },
+  "runtime": {"os": "windows"},
+  "launch": {"executable": "game.exe", "arguments": [], "working_directory": "."},
+  "cleanup": {
+    "delete_parts_after_archive_extract": true,
+    "delete_installer_after_install": true
+  },
+  "saves": {"provider": "ludusavi", "overrides": []},
+  "capabilities_required": {"gamepad": false, "hdr": false, "min_vram_mb": 0}
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 3,
+  "game_id": "case4-direct-exe",
+  "name": "CASE 4: single direct EXE (game executable, NOT an installer) -> PLAY",
+  "version": "1.0",
+  "acquisition": {
+    "provider": "archive",
+    "package_type": "direct_prebuilt",
+    "sources": [
+      {"url": "https://example.invalid/tiny-game.exe", "part": 1, "filename": "tiny-game.exe"}
+    ]
+  },
+  "footprint": {
+    "download_bytes": 67108864,
+    "peak_temp_bytes": 0,
+    "installed_bytes": 67108864,
+    "safety_headroom": 67108864
+  },
+  "package_pipeline": {
+    "prebuilt": {"expected_files": ["tiny-game.exe"]}
+  },
+  "runtime": {"os": "windows"},
+  "launch": {"executable": "tiny-game.exe", "arguments": [], "working_directory": "."},
+  "cleanup": {"delete_archive_after_prebuilt_ready": true},
+  "saves": {"provider": "ludusavi", "overrides": []},
+  "capabilities_required": {"gamepad": false, "hdr": false, "min_vram_mb": 0}
+}
