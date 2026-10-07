@@ -3,6 +3,7 @@ package unit
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/personal-game/personal-game/internal/agent/saves"
@@ -24,12 +25,20 @@ func TestSaveRootsDefaultIsHomeOnly(t *testing.T) {
 func TestSaveRootsParsesListAndSkipsEmpty(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	sep := string(os.PathListSeparator)
-	t.Setenv("PG_SAVE_ROOTS", `E:\pg-work`+sep+`C:\other work`+sep+"")
+	var root1, root2 string
+	if runtime.GOOS == "windows" {
+		root1 = `E:\pg-work`
+		root2 = `C:\other work`
+	} else {
+		root1 = "/opt/pg-work"
+		root2 = "/mnt/other work"
+	}
+	t.Setenv("PG_SAVE_ROOTS", root1+sep+root2+sep+"")
 	roots, err := saves.SaveRoots()
 	if err != nil {
 		t.Fatalf("SaveRoots: %v", err)
 	}
-	want := []string{home, `E:\pg-work`, `C:\other work`}
+	want := []string{home, root1, root2}
 	if len(roots) != len(want) {
 		t.Fatalf("roots = %v, want %v", roots, want)
 	}
