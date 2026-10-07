@@ -25,7 +25,10 @@ The same file can be pasted **whole** into one notebook cell and Run. The
 entry point detects the interactive kernel and never parses the kernel's
 own `sys.argv` (it holds a `kernel-*.json` connection file — not runner
 input). Direct cell execution runs the safe default `diagnostics` command
-(read-only; it never starts a game host or destroys anything). Later cells
+(safe and non-destructive: it never clones, starts a game host, or deletes
+anything; when a repo is already present it may bootstrap the pinned Go
+toolchain into `WORK_ROOT/go` and build/run `agent caps` to report real
+capabilities). Later cells
 can invoke other commands programmatically with an explicit argument list:
 
 ```python

@@ -229,14 +229,20 @@ def test_notebook_bootstrap_on_fresh_kernel(tmp_path, monkeypatch, cells):
                     str(origin)], check=True)
 
     src = cells[0]["source"]
-    src = src.replace('REPO_URL = "https://github.com/rahulsamarth121/personal-game.git"',
-                      f'REPO_URL = r"{origin}"')
-    src = src.replace('WORK_ROOT = Path("/kaggle/working/personal-game-work")',
-                      f'WORK_ROOT = Path(r"{work}")')
-    # Kaggle is Linux with a writable /tmp; the sandbox (e.g. Windows CI)
-    # rewrites every /tmp/ reference -- Path literals AND the path embedded
-    # in the askpass helper -- into the pytest tmp dir.
-    src = src.replace("/tmp/", tmp_path.as_posix() + "/")
+    # Kaggle is Linux with a writable /tmp; redirect ONLY the cell's own
+    # credential-helper files (the two Path literals and the path embedded
+    # in the askpass script) into the pytest tmp dir. This runs FIRST and
+    # targets the exact '/tmp/.pg_' prefix, so it can never touch the
+    # origin/work paths inserted below, however deeply tmp_path is nested
+    # (on Linux tmp_path itself lives under /tmp/).
+    helper_prefix = "/tmp/.pg_"
+    assert src.count(helper_prefix) == 3, "cell 1 credential-helper literals changed"
+    src = src.replace(helper_prefix, tmp_path.as_posix() + "/.pg_")
+    repo_literal = 'REPO_URL = "https://github.com/rahulsamarth121/personal-game.git"'
+    work_literal = 'WORK_ROOT = Path("/kaggle/working/personal-game-work")'
+    assert repo_literal in src and work_literal in src
+    src = src.replace(repo_literal, f'REPO_URL = r"{origin}"')
+    src = src.replace(work_literal, f'WORK_ROOT = Path(r"{work}")')
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake_token_for_local_test_1234567890")
     snapshot = dict(os.environ)
@@ -575,7 +581,7 @@ def test_setup_fails_honestly_without_go_and_without_bootstrap(tmp_path, monkeyp
     assert 'bootstrap unavailable/disabled' in caplog.text
 
 
-def test_diagnostics_swallows_bootstrap_failure_and_stays_read_only(tmp_path, monkeypatch, _runner, caplog):
+def test_diagnostics_swallows_bootstrap_failure_and_leaves_no_toolchain(tmp_path, monkeypatch, _runner, caplog):
     """diagnostics with a repo but an unreachable bootstrap source: exit 0,
     honest warning, and NO toolchain/binary ever left in the work root."""
     _no_go_env(monkeypatch)
@@ -733,6 +739,118 @@ def test_ensure_go_corrupted_toolchain_archive_is_rejected(tmp_path, monkeypatch
         work = Path(cfg['WORK_ROOT'])
         assert not (work / 'go').exists()
         assert not (work / 'go-extract-staging').exists()
+    finally:
+        server.shutdown()
+
+
+def _evil_tarball(kind, outside):
+    """Checksum-valid gzipped tar carrying one hostile member (plus a valid
+    go/bin/go + go/VERSION so only the hostile member can cause rejection)."""
+    import io
+    import tarfile as _tarfile
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode='w:gz', format=_tarfile.GNU_FORMAT) as tf:
+        def add_file(name, data=b'x'):
+            info = _tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+        add_file('go/VERSION', b'fake-go-1.24.11')
+        add_file('go/bin/go', b'#!/bin/sh')
+        if kind == 'dotdot':
+            add_file('../evil.txt', b'pwned')
+        elif kind == 'nested-dotdot':
+            add_file('go/../../evil.txt', b'pwned')
+        elif kind == 'absolute':
+            add_file(outside.as_posix() + '/evil.txt', b'pwned')
+        elif kind in ('symlink-escape', 'symlink-absolute', 'hardlink-escape'):
+            info = _tarfile.TarInfo('go/escape')
+            info.type = _tarfile.SYMTYPE if kind != 'hardlink-escape' else _tarfile.LNKTYPE
+            info.linkname = {'symlink-escape': '../../outside',
+                             'symlink-absolute': outside.as_posix(),
+                             'hardlink-escape': '../../outside/evil.txt'}[kind]
+            tf.addfile(info)
+        elif kind == 'device':
+            info = _tarfile.TarInfo('go/dev')
+            info.type = _tarfile.CHRTYPE
+            tf.addfile(info)
+        else:
+            raise AssertionError(kind)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize('kind', ['dotdot', 'nested-dotdot', 'absolute',
+                                  'symlink-escape', 'symlink-absolute',
+                                  'hardlink-escape', 'device'])
+def test_download_and_extract_go_rejects_malicious_archive(tmp_path, _runner, kind):
+    """A hostile archive that PASSES the sha256 check is still refused by
+    _download_and_extract_go(): nothing is written outside staging, no
+    toolchain is installed, and no staging/tarball residue remains."""
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    data = _evil_tarball(kind, outside)
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go.tgz'] = data
+        cfg = _hidden_go_cfg(tmp_path)
+        url = 'http://127.0.0.1:%d/go.tgz' % server.server_port
+        with pytest.raises(RuntimeError, match='extraction failed'):
+            _runner._download_and_extract_go(cfg, url, hashlib.sha256(data).hexdigest())
+        assert hits.get('/go.tgz') == 1  # it really downloaded and got past the checksum
+        work = Path(cfg['WORK_ROOT'])
+        assert not (work / 'go').exists()
+        assert not (work / 'go-extract-staging').exists()
+        assert not (work / 'go-toolchain.tar.gz').exists()
+        assert not (work / 'evil.txt').exists()
+        assert not (tmp_path / 'evil.txt').exists()
+        assert list(outside.iterdir()) == []
+    finally:
+        server.shutdown()
+
+
+def test_malicious_archive_makes_ensure_go_toolchain_fail_honestly(tmp_path, monkeypatch, _runner):
+    """End to end through ensure_go_toolchain: hostile archive -> None."""
+    data = _evil_tarball('dotdot', tmp_path / 'outside')
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go.tgz'] = data
+        _no_go_env(monkeypatch)
+        cfg = _hidden_go_cfg(
+            tmp_path,
+            GOROOT_URL='http://127.0.0.1:%d/go.tgz' % server.server_port,
+            GOROOT_SHA256=hashlib.sha256(data).hexdigest())
+        assert _runner.ensure_go_toolchain(cfg, {'PATH': os.defpath}) is None
+        assert not (Path(cfg['WORK_ROOT']) / 'go').exists()
+        assert not (tmp_path / 'work' / 'evil.txt').exists()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='symlink extraction needs POSIX')
+def test_download_and_extract_go_allows_safe_internal_symlink(tmp_path, _runner):
+    """No over-rejection: a symlink that stays inside the toolchain is fine."""
+    import io
+    import tarfile as _tarfile
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode='w:gz', format=_tarfile.GNU_FORMAT) as tf:
+        for name, body in (('go/VERSION', b'fake-go-1.24.11'), ('go/bin/go', b'#!/bin/sh')):
+            info = _tarfile.TarInfo(name)
+            info.size = len(body)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(body))
+        link = _tarfile.TarInfo('go/bin/go-alias')
+        link.type = _tarfile.SYMTYPE
+        link.linkname = 'go'
+        tf.addfile(link)
+    data = buf.getvalue()
+    server, payloads, hits = _serve_bytes()
+    try:
+        payloads['/go.tgz'] = data
+        cfg = _hidden_go_cfg(tmp_path)
+        root = _runner._download_and_extract_go(
+            cfg, 'http://127.0.0.1:%d/go.tgz' % server.server_port,
+            hashlib.sha256(data).hexdigest())
+        assert (root / 'bin' / 'go-alias').is_symlink()
     finally:
         server.shutdown()
 

@@ -41,5 +41,6 @@ PG_SESSION_ID=<id> go run ./cmd/agent   # run exactly one session
 
 `PG_SESSION_ID` is debug-only; normal use never needs it.
 
-Troubleshooting: `diagnostics` subcommand of the runner is read-only;
+Troubleshooting: `diagnostics` subcommand of the runner is safe and non-destructive (it may
+build and run `agent caps` when a repo is present);
 `docs/operations/troubleshooting.md` for the rest.

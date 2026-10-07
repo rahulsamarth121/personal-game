@@ -10,9 +10,12 @@ The SAME file also supports direct execution inside Jupyter/Kaggle: paste
 the entire source into one cell and Run. The entry point detects the
 interactive kernel, never parses the kernel's own ``sys.argv`` (which
 holds a ``kernel-*.json`` connection file), and runs the safe default
-command ``diagnostics`` (read-only). Further cells can invoke specific
-commands programmatically: ``runner.main(["all"])``, ``runner.main(["run"])``,
-``runner.main(["cleanup"])`` — always with an explicit argument list.
+command ``diagnostics`` (safe and non-destructive: it never clones, starts a
+game host, or deletes anything; when a repo is already present it may
+bootstrap Go into WORK_ROOT and build/run ``agent caps``). Further cells can
+invoke specific commands programmatically: ``runner.main(["all"])``,
+``runner.main(["run"])``, ``runner.main(["cleanup"])`` — always with an
+explicit argument list.
 
 Workflow: detect environment -> clone/pull the GitHub repo -> check deps ->
 diagnose capabilities honestly -> build shared ``cmd/agent`` -> launch it
@@ -37,7 +40,7 @@ import sys
 import tarfile
 import time
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # Default control path for this deployment: the Personal Game Cloudflare
 # edge relay in front of the Go control plane (control HTTP only — the
@@ -329,7 +332,11 @@ def control_reachable(url: str) -> bool:
 
 
 def cmd_diagnostics(args: argparse.Namespace) -> int:
-    """Read-only capability report. Missing capabilities are reported, never faked."""
+    """Safe, non-destructive capability report. Missing capabilities are reported,
+    never faked. When a repository is present, diagnostics may bootstrap a
+    pinned Go toolchain into WORK_ROOT and build/run `agent caps` to obtain
+    real capabilities — it never clones the repo or destroys anything.
+    """
     cfg = load_config(args)
     log.info("OS: %s", platform.platform())
     log.info("CPU: %s x%d", platform.processor() or "unknown", os.cpu_count() or 0)
@@ -437,6 +444,46 @@ def _looks_like_go_root(root: Path) -> bool:
     return (root / "bin" / "go").exists() and (root / "VERSION").exists()
 
 
+def _safe_tar_members(tf: tarfile.TarFile, dest: Path) -> list:
+    """Validate every member of an archive before anything is extracted.
+
+    Rejects absolute paths, ``..`` traversal, members resolving outside
+    ``dest``, non-regular/dir/link member types (devices, FIFOs), and
+    symlinks/hardlinks whose target escapes ``dest``. Works on every Python
+    the runner supports (does not depend on the 3.12 ``filter=`` API).
+    """
+    base = dest.resolve()
+
+    def inside(candidate: Path) -> bool:
+        try:
+            candidate.resolve().relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    def bad_path(name: str) -> bool:
+        posix, win = PurePosixPath(name), PureWindowsPath(name)
+        return (posix.is_absolute() or win.is_absolute() or bool(win.drive)
+                or name.startswith(("/", "\\")) or ".." in posix.parts
+                or ".." in win.parts)
+
+    members = tf.getmembers()
+    for m in members:
+        if bad_path(m.name) or not inside(base / m.name):
+            raise RuntimeError(f"unsafe path in Go archive: {m.name!r}")
+        if m.isdev() or m.isfifo() or not (m.isfile() or m.isdir() or m.issym() or m.islnk()):
+            raise RuntimeError(f"unsupported member type in Go archive: {m.name!r}")
+        if m.issym():
+            if bad_path(m.linkname) or not inside((base / m.name).parent / m.linkname):
+                raise RuntimeError(
+                    f"unsafe symlink in Go archive: {m.name!r} -> {m.linkname!r}")
+        elif m.islnk():
+            if bad_path(m.linkname) or not inside(base / m.linkname):
+                raise RuntimeError(
+                    f"unsafe hardlink in Go archive: {m.name!r} -> {m.linkname!r}")
+    return members
+
+
 def _download_and_extract_go(cfg: dict, url: str, expected_sha: str) -> Path:
     """Download + sha256-verify + extract the official Go tarball into WORK_ROOT.
 
@@ -465,7 +512,11 @@ def _download_and_extract_go(cfg: dict, url: str, expected_sha: str) -> Path:
     staging.mkdir(parents=True)
     try:
         with tarfile.open(tarball, "r:gz") as tf:
-            tf.extractall(staging)  # noqa: S202 - verified pinned archive
+            members = _safe_tar_members(tf, staging)
+            if hasattr(tarfile, "data_filter"):  # 3.12+ / 3.11.4+: defense in depth
+                tf.extractall(staging, members=members, filter="data")
+            else:
+                tf.extractall(staging, members=members)  # noqa: S202 - validated above
     except Exception as exc:
         shutil.rmtree(staging, ignore_errors=True)
         raise RuntimeError(f"Go toolchain extraction failed: {exc}") from exc
@@ -688,7 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
     for name, fn, help_text in [
         ("clone", cmd_clone, "clone/pull the GitHub repo (safe, idempotent)"),
-        ("diagnostics", cmd_diagnostics, "honest capability report (read-only)"),
+        ("diagnostics", cmd_diagnostics, "honest capability report (safe, non-destructive)"),
         ("setup", cmd_setup, "check deps and build the agent (idempotent)"),
         ("run", cmd_run, "build if needed and run the agent (foreground)"),
         ("cleanup", cmd_cleanup, "remove ephemeral staging only (never saves)"),
@@ -725,7 +776,7 @@ def print_status(cfg: dict) -> None:
 # --- execution context / argument resolution ------------------------------
 
 # Safe default when the whole runner source is pasted into a notebook cell:
-# read-only, honest, non-destructive, and it never starts a game host.
+# safe, non-destructive, and it never starts a game host or destroys anything.
 NOTEBOOK_DEFAULT_COMMAND = "diagnostics"
 
 
@@ -786,7 +837,7 @@ def main(argv=None) -> int:
     if notebook_mode:
         print("NOTEBOOK MODE: runner source executed inside an interactive kernel.")
         print("The kernel's own arguments were ignored (they are not runner input).")
-        print(f"Running the safe default command {NOTEBOOK_DEFAULT_COMMAND!r} (read-only).")
+        print(f"Running the safe default command {NOTEBOOK_DEFAULT_COMMAND!r} (safe, non-destructive; may build `agent caps`).")
         print("Other commands in later cells: runner.main([\"all\"]), "
               "runner.main([\"run\"]), runner.main([\"cleanup\"]), ...")
         print()
